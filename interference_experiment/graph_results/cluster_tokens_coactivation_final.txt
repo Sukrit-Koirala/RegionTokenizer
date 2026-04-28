@@ -1,0 +1,13 @@
+Cluster token report — coactivation | layer=final
+Model: gpt2-xl  |  9 clusters
+======================================================================
+
+Cluster   0  (size= 683):  the | . | of | , | and | a | to | in | was | , | . | is | were | with | that
+Cluster   1  (size= 240):  @ | ) | The | 1 | 18 | 2 | In | 3 | ). | the | 4 | 1 | 6 | m | 0
+Cluster   2  (size=1037):  - | s | j | a | illo | i | ia | es | ing | as | z | ed | ria | alky | th
+Cluster   3  (size=  12):  の | い | ュ | キ | ア | � | � | ヴァ | ン | � | ラ | リ
+Cluster   4  (size=  96):  2012 | May | 2011 | April | 2009 | July | November | addition | 1861 | October | June | 2010 | 2006 | 1920 | 2008
+Cluster   5  (size= 156):  be | have | use | play | take | make | include | live | support | do | win | help | 't | get | lead
+Cluster   6  (size=  21):  � | � | � | � | � | � | � | � | � | � | � | � | � | � | �
+Cluster   7  (size=1896):  " | gods | first | aircraft | god | game | other | album | new | time | number | film | more | most | team
+Cluster   8  (size= 859):  \n | The | = |  | He | I | She | Fey | New | C | In | John | Rock | UK | V

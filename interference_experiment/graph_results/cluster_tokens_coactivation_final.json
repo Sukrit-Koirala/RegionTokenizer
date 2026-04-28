@@ -1,0 +1,880 @@
+{
+  "0": [
+    {
+      "token": " the",
+      "token_id": 262,
+      "freq": 9034
+    },
+    {
+      "token": " .",
+      "token_id": 764,
+      "freq": 3675
+    },
+    {
+      "token": " of",
+      "token_id": 286,
+      "freq": 3361
+    },
+    {
+      "token": " ,",
+      "token_id": 837,
+      "freq": 2984
+    },
+    {
+      "token": " and",
+      "token_id": 290,
+      "freq": 2963
+    },
+    {
+      "token": " a",
+      "token_id": 257,
+      "freq": 2411
+    },
+    {
+      "token": " to",
+      "token_id": 284,
+      "freq": 1948
+    },
+    {
+      "token": " in",
+      "token_id": 287,
+      "freq": 1822
+    },
+    {
+      "token": " was",
+      "token_id": 373,
+      "freq": 1658
+    },
+    {
+      "token": ",",
+      "token_id": 11,
+      "freq": 1474
+    },
+    {
+      "token": ".",
+      "token_id": 13,
+      "freq": 1331
+    },
+    {
+      "token": " is",
+      "token_id": 318,
+      "freq": 1075
+    },
+    {
+      "token": " were",
+      "token_id": 547,
+      "freq": 709
+    },
+    {
+      "token": " with",
+      "token_id": 351,
+      "freq": 651
+    },
+    {
+      "token": " that",
+      "token_id": 326,
+      "freq": 605
+    },
+    {
+      "token": " for",
+      "token_id": 329,
+      "freq": 601
+    },
+    {
+      "token": " are",
+      "token_id": 389,
+      "freq": 550
+    },
+    {
+      "token": " as",
+      "token_id": 355,
+      "freq": 540
+    },
+    {
+      "token": " by",
+      "token_id": 416,
+      "freq": 533
+    },
+    {
+      "token": " on",
+      "token_id": 319,
+      "freq": 532
+    }
+  ],
+  "1": [
+    {
+      "token": "@",
+      "token_id": 31,
+      "freq": 785
+    },
+    {
+      "token": " )",
+      "token_id": 1267,
+      "freq": 416
+    },
+    {
+      "token": "The",
+      "token_id": 464,
+      "freq": 396
+    },
+    {
+      "token": " 1",
+      "token_id": 352,
+      "freq": 191
+    },
+    {
+      "token": " 18",
+      "token_id": 1248,
+      "freq": 140
+    },
+    {
+      "token": " 2",
+      "token_id": 362,
+      "freq": 73
+    },
+    {
+      "token": "In",
+      "token_id": 818,
+      "freq": 65
+    },
+    {
+      "token": " 3",
+      "token_id": 513,
+      "freq": 60
+    },
+    {
+      "token": " ).",
+      "token_id": 6739,
+      "freq": 51
+    },
+    {
+      "token": "the",
+      "token_id": 1169,
+      "freq": 48
+    },
+    {
+      "token": " 4",
+      "token_id": 604,
+      "freq": 46
+    },
+    {
+      "token": "1",
+      "token_id": 16,
+      "freq": 45
+    },
+    {
+      "token": " 6",
+      "token_id": 718,
+      "freq": 45
+    },
+    {
+      "token": " m",
+      "token_id": 285,
+      "freq": 42
+    },
+    {
+      "token": " 0",
+      "token_id": 657,
+      "freq": 37
+    },
+    {
+      "token": " ft",
+      "token_id": 10117,
+      "freq": 36
+    },
+    {
+      "token": "P",
+      "token_id": 47,
+      "freq": 36
+    },
+    {
+      "token": ")",
+      "token_id": 8,
+      "freq": 36
+    },
+    {
+      "token": " 5",
+      "token_id": 642,
+      "freq": 36
+    },
+    {
+      "token": " 000",
+      "token_id": 12877,
+      "freq": 33
+    }
+  ],
+  "2": [
+    {
+      "token": "-",
+      "token_id": 12,
+      "freq": 1268
+    },
+    {
+      "token": "s",
+      "token_id": 82,
+      "freq": 737
+    },
+    {
+      "token": "j",
+      "token_id": 73,
+      "freq": 96
+    },
+    {
+      "token": "a",
+      "token_id": 64,
+      "freq": 93
+    },
+    {
+      "token": "illo",
+      "token_id": 16111,
+      "freq": 85
+    },
+    {
+      "token": "i",
+      "token_id": 72,
+      "freq": 82
+    },
+    {
+      "token": "ia",
+      "token_id": 544,
+      "freq": 80
+    },
+    {
+      "token": "es",
+      "token_id": 274,
+      "freq": 72
+    },
+    {
+      "token": "ing",
+      "token_id": 278,
+      "freq": 71
+    },
+    {
+      "token": "as",
+      "token_id": 292,
+      "freq": 70
+    },
+    {
+      "token": "z",
+      "token_id": 89,
+      "freq": 68
+    },
+    {
+      "token": "ed",
+      "token_id": 276,
+      "freq": 68
+    },
+    {
+      "token": "ria",
+      "token_id": 7496,
+      "freq": 56
+    },
+    {
+      "token": "alky",
+      "token_id": 18354,
+      "freq": 55
+    },
+    {
+      "token": "th",
+      "token_id": 400,
+      "freq": 53
+    },
+    {
+      "token": "l",
+      "token_id": 75,
+      "freq": 53
+    },
+    {
+      "token": "n",
+      "token_id": 77,
+      "freq": 50
+    },
+    {
+      "token": "\u00ed",
+      "token_id": 8836,
+      "freq": 47
+    },
+    {
+      "token": "al",
+      "token_id": 282,
+      "freq": 44
+    },
+    {
+      "token": "ra",
+      "token_id": 430,
+      "freq": 43
+    }
+  ],
+  "3": [
+    {
+      "token": "\u306e",
+      "token_id": 5641,
+      "freq": 11
+    },
+    {
+      "token": "\u3044",
+      "token_id": 18566,
+      "freq": 8
+    },
+    {
+      "token": "\u30e5",
+      "token_id": 24440,
+      "freq": 4
+    },
+    {
+      "token": "\u30ad",
+      "token_id": 25084,
+      "freq": 4
+    },
+    {
+      "token": "\u30a2",
+      "token_id": 11839,
+      "freq": 4
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 163,
+      "freq": 3
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 2515,
+      "freq": 3
+    },
+    {
+      "token": "\u30f4\u30a1",
+      "token_id": 44444,
+      "freq": 3
+    },
+    {
+      "token": "\u30f3",
+      "token_id": 6527,
+      "freq": 2
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 32368,
+      "freq": 2
+    },
+    {
+      "token": "\u30e9",
+      "token_id": 9263,
+      "freq": 2
+    },
+    {
+      "token": "\u30ea",
+      "token_id": 12675,
+      "freq": 2
+    }
+  ],
+  "4": [
+    {
+      "token": " 2012",
+      "token_id": 2321,
+      "freq": 34
+    },
+    {
+      "token": " May",
+      "token_id": 1737,
+      "freq": 29
+    },
+    {
+      "token": " 2011",
+      "token_id": 2813,
+      "freq": 24
+    },
+    {
+      "token": " April",
+      "token_id": 3035,
+      "freq": 24
+    },
+    {
+      "token": " 2009",
+      "token_id": 3717,
+      "freq": 21
+    },
+    {
+      "token": " July",
+      "token_id": 2901,
+      "freq": 20
+    },
+    {
+      "token": " November",
+      "token_id": 3389,
+      "freq": 19
+    },
+    {
+      "token": " addition",
+      "token_id": 3090,
+      "freq": 18
+    },
+    {
+      "token": " 1861",
+      "token_id": 45278,
+      "freq": 17
+    },
+    {
+      "token": " October",
+      "token_id": 3267,
+      "freq": 16
+    },
+    {
+      "token": " June",
+      "token_id": 2795,
+      "freq": 16
+    },
+    {
+      "token": " 2010",
+      "token_id": 3050,
+      "freq": 15
+    },
+    {
+      "token": " 2006",
+      "token_id": 4793,
+      "freq": 15
+    },
+    {
+      "token": " 1920",
+      "token_id": 14062,
+      "freq": 15
+    },
+    {
+      "token": " 2008",
+      "token_id": 3648,
+      "freq": 15
+    },
+    {
+      "token": " 2013",
+      "token_id": 2211,
+      "freq": 15
+    },
+    {
+      "token": " January",
+      "token_id": 3269,
+      "freq": 13
+    },
+    {
+      "token": " February",
+      "token_id": 3945,
+      "freq": 13
+    },
+    {
+      "token": " 1930",
+      "token_id": 15533,
+      "freq": 13
+    },
+    {
+      "token": " 2015",
+      "token_id": 1853,
+      "freq": 12
+    }
+  ],
+  "5": [
+    {
+      "token": " be",
+      "token_id": 307,
+      "freq": 364
+    },
+    {
+      "token": " have",
+      "token_id": 423,
+      "freq": 166
+    },
+    {
+      "token": " use",
+      "token_id": 779,
+      "freq": 46
+    },
+    {
+      "token": " play",
+      "token_id": 711,
+      "freq": 32
+    },
+    {
+      "token": " take",
+      "token_id": 1011,
+      "freq": 25
+    },
+    {
+      "token": " make",
+      "token_id": 787,
+      "freq": 24
+    },
+    {
+      "token": " include",
+      "token_id": 2291,
+      "freq": 24
+    },
+    {
+      "token": " live",
+      "token_id": 2107,
+      "freq": 23
+    },
+    {
+      "token": " support",
+      "token_id": 1104,
+      "freq": 19
+    },
+    {
+      "token": " do",
+      "token_id": 466,
+      "freq": 18
+    },
+    {
+      "token": " win",
+      "token_id": 1592,
+      "freq": 18
+    },
+    {
+      "token": " help",
+      "token_id": 1037,
+      "freq": 16
+    },
+    {
+      "token": "'t",
+      "token_id": 470,
+      "freq": 16
+    },
+    {
+      "token": " get",
+      "token_id": 651,
+      "freq": 15
+    },
+    {
+      "token": " lead",
+      "token_id": 1085,
+      "freq": 14
+    },
+    {
+      "token": " return",
+      "token_id": 1441,
+      "freq": 14
+    },
+    {
+      "token": " start",
+      "token_id": 923,
+      "freq": 12
+    },
+    {
+      "token": " prevent",
+      "token_id": 2948,
+      "freq": 12
+    },
+    {
+      "token": " protect",
+      "token_id": 1805,
+      "freq": 11
+    },
+    {
+      "token": " fly",
+      "token_id": 6129,
+      "freq": 11
+    }
+  ],
+  "6": [
+    {
+      "token": "\ufffd",
+      "token_id": 254,
+      "freq": 9
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 238,
+      "freq": 8
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 247,
+      "freq": 7
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 228,
+      "freq": 6
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 246,
+      "freq": 5
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 107,
+      "freq": 5
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 99,
+      "freq": 4
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 224,
+      "freq": 4
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 112,
+      "freq": 4
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 249,
+      "freq": 4
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 117,
+      "freq": 3
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 97,
+      "freq": 3
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 111,
+      "freq": 3
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 110,
+      "freq": 3
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 103,
+      "freq": 2
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 255,
+      "freq": 2
+    },
+    {
+      "token": "\ufffd\ufffd",
+      "token_id": 46788,
+      "freq": 2
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 223,
+      "freq": 2
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 244,
+      "freq": 2
+    },
+    {
+      "token": "\ufffd",
+      "token_id": 95,
+      "freq": 2
+    }
+  ],
+  "7": [
+    {
+      "token": " \"",
+      "token_id": 366,
+      "freq": 995
+    },
+    {
+      "token": " gods",
+      "token_id": 11858,
+      "freq": 228
+    },
+    {
+      "token": " first",
+      "token_id": 717,
+      "freq": 223
+    },
+    {
+      "token": " aircraft",
+      "token_id": 6215,
+      "freq": 164
+    },
+    {
+      "token": " god",
+      "token_id": 5770,
+      "freq": 139
+    },
+    {
+      "token": " game",
+      "token_id": 983,
+      "freq": 124
+    },
+    {
+      "token": " other",
+      "token_id": 584,
+      "freq": 118
+    },
+    {
+      "token": " album",
+      "token_id": 5062,
+      "freq": 115
+    },
+    {
+      "token": " new",
+      "token_id": 649,
+      "freq": 109
+    },
+    {
+      "token": " time",
+      "token_id": 640,
+      "freq": 104
+    },
+    {
+      "token": " number",
+      "token_id": 1271,
+      "freq": 86
+    },
+    {
+      "token": " film",
+      "token_id": 2646,
+      "freq": 86
+    },
+    {
+      "token": " more",
+      "token_id": 517,
+      "freq": 86
+    },
+    {
+      "token": " most",
+      "token_id": 749,
+      "freq": 84
+    },
+    {
+      "token": " team",
+      "token_id": 1074,
+      "freq": 82
+    },
+    {
+      "token": " season",
+      "token_id": 1622,
+      "freq": 80
+    },
+    {
+      "token": " deities",
+      "token_id": 43844,
+      "freq": 79
+    },
+    {
+      "token": " gold",
+      "token_id": 3869,
+      "freq": 77
+    },
+    {
+      "token": " same",
+      "token_id": 976,
+      "freq": 76
+    },
+    {
+      "token": " band",
+      "token_id": 4097,
+      "freq": 74
+    }
+  ],
+  "8": [
+    {
+      "token": "\n",
+      "token_id": 198,
+      "freq": 1912
+    },
+    {
+      "token": " The",
+      "token_id": 383,
+      "freq": 1329
+    },
+    {
+      "token": " =",
+      "token_id": 796,
+      "freq": 790
+    },
+    {
+      "token": "\u00a0",
+      "token_id": 1849,
+      "freq": 224
+    },
+    {
+      "token": " He",
+      "token_id": 679,
+      "freq": 151
+    },
+    {
+      "token": " I",
+      "token_id": 314,
+      "freq": 147
+    },
+    {
+      "token": " She",
+      "token_id": 1375,
+      "freq": 132
+    },
+    {
+      "token": " Fey",
+      "token_id": 39775,
+      "freq": 123
+    },
+    {
+      "token": " New",
+      "token_id": 968,
+      "freq": 88
+    },
+    {
+      "token": " C",
+      "token_id": 327,
+      "freq": 77
+    },
+    {
+      "token": " In",
+      "token_id": 554,
+      "freq": 72
+    },
+    {
+      "token": " John",
+      "token_id": 1757,
+      "freq": 64
+    },
+    {
+      "token": " Rock",
+      "token_id": 4631,
+      "freq": 63
+    },
+    {
+      "token": " UK",
+      "token_id": 3482,
+      "freq": 61
+    },
+    {
+      "token": " V",
+      "token_id": 569,
+      "freq": 58
+    },
+    {
+      "token": " Blue",
+      "token_id": 4518,
+      "freq": 49
+    },
+    {
+      "token": " United",
+      "token_id": 1578,
+      "freq": 47
+    },
+    {
+      "token": " Barker",
+      "token_id": 36933,
+      "freq": 47
+    },
+    {
+      "token": " H",
+      "token_id": 367,
+      "freq": 46
+    },
+    {
+      "token": " Little",
+      "token_id": 7703,
+      "freq": 45
+    }
+  ]
+}

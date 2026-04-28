@@ -1,0 +1,38 @@
+{
+  "config": {
+    "model_name": "gpt2-xl",
+    "fallback_model_name": "gpt2-medium",
+    "device": "cuda",
+    "fp16": true,
+    "dataset_name": "wikitext",
+    "dataset_config": "wikitext-2-raw-v1",
+    "max_tokens": 50000,
+    "seq_len": 512,
+    "batch_size": 4,
+    "layer_index": -1,
+    "top_k": 20,
+    "vocab_subset_size": 5000,
+    "n_clusters": 50,
+    "louvain_resolution": 1.0,
+    "layer_compare_indices": [
+      0,
+      23,
+      -1
+    ],
+    "data_dir": "data",
+    "graphs_dir": "graphs",
+    "results_dir": "results",
+    "seed": 42
+  },
+  "model": "gpt2-xl",
+  "max_tokens": 50000,
+  "vocab_subset_size": 5000,
+  "coactivation_louvain_Q": 0.5269,
+  "gradient_louvain_Q": 0.2838,
+  "coactivation_nmi_lv_sp": 0.5667,
+  "gradient_nmi_lv_sp": 0.4214,
+  "coactivation_PR": 2220.83,
+  "gradient_PR": 655.92,
+  "layer_comparison": null,
+  "elapsed_s": 3322.4
+}
