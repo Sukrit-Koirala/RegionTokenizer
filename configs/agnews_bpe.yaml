@@ -1,0 +1,26 @@
+dataset:
+  name: ag_news
+  seq_len: 256
+
+tokenizer:
+  type: bpe
+  vocab_size: 16000
+  train: true
+
+model:
+  d_model: 384
+  n_layers: 6
+  n_heads: 6
+
+training:
+  batch_size: 32
+  grad_accum: 1
+  epochs: 20
+  lr: 0.0003
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  seed: 42
+
+logging:
+  log_steps: 100
+  eval_every: 1
