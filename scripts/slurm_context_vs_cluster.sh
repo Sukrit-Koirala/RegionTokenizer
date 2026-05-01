@@ -65,4 +65,5 @@ python interference_experiment/context_vs_cluster.py \
     --subcluster_map interference_experiment/results/cluster7_subcluster_mapping.json \
     --output_dir     interference_experiment/results/context_vs_cluster \
     --min_occurrences 20 \
-    --seed 42
+    --n_pairs        10000 \
+    --seed           42

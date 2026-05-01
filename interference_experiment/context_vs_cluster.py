@@ -74,21 +74,133 @@ log = logging.getLogger("ctx_cluster")
 # Distance utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
-def mean_pairwise_l2(vecs: torch.Tensor) -> float:
+def _pairwise_l2_sampled(
+    h: torch.Tensor,        # (N, D)
+    idx1: np.ndarray,       # (P,) int64 — first index of each pair
+    idx2: np.ndarray,       # (P,) int64 — second index of each pair
+    device: torch.device,
+) -> float:
+    """Mean L2 distance for a pre-sampled set of pairs. O(P·D) — no N² anywhere."""
+    if len(idx1) == 0:
+        return float("nan")
+    h1 = h[torch.from_numpy(idx1).to(device)]   # (P, D)
+    h2 = h[torch.from_numpy(idx2).to(device)]   # (P, D)
+    return float((h1 - h2).norm(dim=1).mean())
+
+
+def sample_pair_distances(
+    h: torch.Tensor,                    # (N, D) — already on device, optionally normalized
+    groups: "TokenGroups",
+    clusters_np: np.ndarray,            # (N,) int32 — cluster label for all N positions
+    n_pairs: int,
+    rng: np.random.Generator,
+    device: torch.device,
+) -> Tuple[float, float, float]:
     """
-    Mean L2 distance over all unique pairs in vecs of shape (m, D).
-    Uses the identity ||a-b||² = ||a||²+||b||²-2(a·b) to avoid the O(m²D)
-    broadcast; only builds an (m, m) matrix which is cheap for m << D.
+    Sample pairs for three conditions and return mean L2 distances.
+
+    A — same token, different occurrence:
+        token_ids[i] == token_ids[j],  i != j
+
+    B — same cluster, different token:
+        cluster_ids[i] == cluster_ids[j],  token_ids[i] != token_ids[j]
+
+    C — different cluster:
+        cluster_ids[i] != cluster_ids[j]
+
+    Each condition samples up to n_pairs pairs total (oversampling then slicing).
+    No O(N²) anywhere — all pair indices are materialized as int64 arrays.
     """
-    m = len(vecs)
-    if m < 2:
-        return 0.0
-    sq    = (vecs * vecs).sum(dim=1, keepdim=True)    # (m, 1)
-    cross = vecs @ vecs.T                              # (m, m)
-    sq_dist = (sq + sq.T - 2.0 * cross).clamp(min=0)  # (m, m)
-    dist = sq_dist.sqrt()
-    rows, cols = torch.triu_indices(m, m, offset=1, device=vecs.device)
-    return float(dist[rows, cols].mean()) if rows.numel() > 0 else 0.0
+    N = h.shape[0]
+
+    # ── A: same token, different occurrence ──────────────────────────────────
+    # Per-token: sample k pairs from that token's occurrences; average across tokens.
+    n_tokens = max(len(groups.token_to_idx), 1)
+    k_per_tok = max(n_pairs // n_tokens, 10)
+    a_vals: List[float] = []
+    for idx in groups.token_to_idx.values():
+        n_t = len(idx)
+        if n_t < 2:
+            continue
+        p1 = rng.integers(0, n_t, size=k_per_tok * 3)
+        p2 = rng.integers(0, n_t, size=k_per_tok * 3)
+        keep = p1 != p2
+        p1, p2 = p1[keep][:k_per_tok], p2[keep][:k_per_tok]
+        if len(p1) == 0:
+            continue
+        a_vals.append(_pairwise_l2_sampled(h, idx[p1], idx[p2], device))
+    dist_A = float(np.nanmean(a_vals)) if a_vals else float("nan")
+
+    # ── B: same cluster, different token ─────────────────────────────────────
+    # Per cluster: pool all qualified-token occurrences, sample pairs with
+    # different token_id labels; average across clusters.
+    n_clusters = max(len(groups.cluster_ids), 1)
+    k_per_cl = max(n_pairs // n_clusters, 50)
+    b_vals: List[float] = []
+    for cid in groups.cluster_ids:
+        tok_list = [t for t in groups.cluster_to_tokens[cid]
+                    if t in groups.token_to_idx]
+        if len(tok_list) < 2:
+            continue
+        all_idx_c = np.concatenate([groups.token_to_idx[t] for t in tok_list])
+        all_tok_c = np.concatenate(
+            [np.full(len(groups.token_to_idx[t]), t, dtype=np.int64) for t in tok_list]
+        )
+        N_c = len(all_idx_c)
+        p1 = rng.integers(0, N_c, size=k_per_cl * 4)
+        p2 = rng.integers(0, N_c, size=k_per_cl * 4)
+        keep = all_tok_c[p1] != all_tok_c[p2]
+        p1, p2 = p1[keep][:k_per_cl], p2[keep][:k_per_cl]
+        if len(p1) == 0:
+            continue
+        b_vals.append(_pairwise_l2_sampled(h, all_idx_c[p1], all_idx_c[p2], device))
+    dist_B = float(np.nanmean(b_vals)) if b_vals else float("nan")
+
+    # ── C: different cluster ──────────────────────────────────────────────────
+    # Sample from all N positions; ~88% of random pairs cross cluster boundaries.
+    p1 = rng.integers(0, N, size=n_pairs * 2).astype(np.int64)
+    p2 = rng.integers(0, N, size=n_pairs * 2).astype(np.int64)
+    keep = clusters_np[p1] != clusters_np[p2]
+    p1, p2 = p1[keep][:n_pairs], p2[keep][:n_pairs]
+    dist_C = _pairwise_l2_sampled(h, p1, p2, device)
+
+    return dist_A, dist_B, dist_C
+
+
+def build_final_layer_centroids(
+    h_np: np.ndarray,       # (N, D) float16 — final layer hidden states
+    groups: "TokenGroups",
+    device: torch.device,
+    normalize: bool,
+) -> Tuple[torch.Tensor, List[int]]:
+    """
+    Compute cluster centroids from the FINAL layer's hidden states.
+    Centroid of cluster k = mean of per-token means for all qualified tokens in k.
+
+    These centroids are fixed and reused across all layers for the flip-rate metric,
+    so that the flip rate measures "does h at layer l map to the correct region
+    as defined by the final representation?" rather than "does h map to its own
+    layer's centroid?" (which is trivially low for any well-trained model).
+    """
+    h = torch.from_numpy(h_np.astype(np.float32)).to(device)
+    if normalize:
+        h = h / h.norm(dim=1, keepdim=True).clamp(min=1e-8)
+
+    centroid_list: List[torch.Tensor] = []
+    centroid_ids:  List[int] = []
+    for cid in groups.cluster_ids:
+        tok_list = [t for t in groups.cluster_to_tokens[cid]
+                    if t in groups.token_to_idx]
+        if not tok_list:
+            continue
+        mu_list = []
+        for t in tok_list:
+            idx_t = torch.from_numpy(groups.token_to_idx[t]).to(device)
+            mu_list.append(h[idx_t].mean(dim=0))
+        centroid_list.append(torch.stack(mu_list).mean(dim=0))
+        centroid_ids.append(cid)
+
+    return torch.stack(centroid_list), centroid_ids   # (K, D),  [int, ...]
 
 
 def nearest_centroid_assign(h: torch.Tensor, centroids: torch.Tensor) -> torch.Tensor:
@@ -260,135 +372,101 @@ class TokenGroups:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def analyze_layer(
-    h_np: np.ndarray,          # (N, D) float16 from cache
+    h_np: np.ndarray,
     groups: TokenGroups,
+    clusters_np: np.ndarray,
+    final_centroids: torch.Tensor,
+    final_centroid_ids: List[int],
+    final_sub_centroids: Optional[torch.Tensor],
+    final_sub_centroid_ids: Optional[List[int]],
     device: torch.device,
+    n_pairs: int,
+    normalize: bool,
+    rng: np.random.Generator,
 ) -> dict:
     """
-    Compute all five metrics for one layer.
-    Loads h_np into GPU float32; everything else is torch.
+    Compute all metrics for one layer using sampled pair distances.
+    A = same token (contextual drift), B = same cluster diff token, C = diff cluster.
+    Flip rate uses precomputed final-layer centroids so it measures whether
+    representations at layer l map to the correct final-layer cluster region.
     """
-    h = torch.from_numpy(h_np.astype(np.float32)).to(device)  # (N, D)
+    h = torch.from_numpy(h_np.astype(np.float32)).to(device)
 
     avg_norm = float(h.norm(dim=1).mean())
-    norm_denom = max(avg_norm, 1e-8)
 
-    # ── 1. Per-token means ───────────────────────────────────────────────────
-    token_means: Dict[int, torch.Tensor] = {}
-    for tok, idx in groups.token_to_idx.items():
-        idx_t = torch.from_numpy(idx).to(device)
-        token_means[tok] = h[idx_t].mean(dim=0)   # (D,)
+    if normalize:
+        h = h / h.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        norm_denom = 1.0
+    else:
+        norm_denom = max(avg_norm, 1e-8)
 
-    # ── 2. Contextual drift ──────────────────────────────────────────────────
-    drifts: List[float] = []
-    for tok, idx in groups.token_to_idx.items():
-        idx_t = torch.from_numpy(idx).to(device)
-        h_tok = h[idx_t]                                      # (n_t, D)
-        mu    = token_means[tok].unsqueeze(0)                 # (1, D)
-        drifts.append(float((h_tok - mu).norm(dim=1).mean()))
-    contextual_drift_raw = float(np.mean(drifts)) if drifts else 0.0
+    # ── A/B/C sampled pair distances ─────────────────────────────────────────
+    dist_A_raw, dist_B_raw, dist_C_raw = sample_pair_distances(
+        h, groups, clusters_np, n_pairs, rng, device
+    )
+    dist_A = dist_A_raw / norm_denom
+    dist_B = dist_B_raw / norm_denom
+    dist_C = dist_C_raw / norm_denom
 
-    # ── 3. Intra-cluster distance (mean pairwise between token means) ────────
-    intra_raw_list: List[float] = []
-    for cid in groups.cluster_ids:
-        vecs = [token_means[t] for t in groups.cluster_to_tokens[cid]
-                if t in token_means]
-        if len(vecs) < 2:
-            continue
-        intra_raw_list.append(mean_pairwise_l2(torch.stack(vecs)))
-    intra_cluster_raw = float(np.mean(intra_raw_list)) if intra_raw_list else 0.0
-
-    # ── 4. Inter-cluster distance (mean pairwise between cluster centroids) ──
-    centroid_list: List[torch.Tensor] = []
-    centroid_ids:  List[int] = []
-    for cid in groups.cluster_ids:
-        vecs = [token_means[t] for t in groups.cluster_to_tokens[cid]
-                if t in token_means]
-        if not vecs:
-            continue
-        centroid_list.append(torch.stack(vecs).mean(dim=0))
-        centroid_ids.append(cid)
-    centroids = torch.stack(centroid_list)             # (K, D)
-    inter_cluster_raw = mean_pairwise_l2(centroids)
-
-    # ── 5. Normalize by average hidden-state norm ────────────────────────────
-    contextual_drift = contextual_drift_raw / norm_denom
-    intra_cluster    = intra_cluster_raw    / norm_denom
-    inter_cluster    = inter_cluster_raw    / norm_denom
-
-    # ── 6. Cluster flip rate (nearest centroid over all N samples at once) ───
-    pred_centroid_idx = nearest_centroid_assign(h, centroids)  # (N,) indices
-    pred_cid_for_sample = torch.tensor(
-        [centroid_ids[i] for i in pred_centroid_idx.cpu().tolist()],
-        dtype=torch.long,
-    )   # (N,) cluster IDs
+    # ── Cluster flip rate (final-layer centroids) ─────────────────────────────
+    fc = final_centroids.to(device)
+    pred_centroid_idx = nearest_centroid_assign(h, fc)  # (N,)
+    pred_cid_list = [final_centroid_ids[i] for i in pred_centroid_idx.cpu().tolist()]
+    pred_cid_t = torch.tensor(pred_cid_list, dtype=torch.long)
 
     flip_rates: List[float] = []
     for tok, idx in groups.token_to_idx.items():
         true_c = groups.token_to_cluster[tok]
-        pred_c = pred_cid_for_sample[torch.from_numpy(idx)]
+        pred_c = pred_cid_t[torch.from_numpy(idx)]
         flip_rates.append(float((pred_c != true_c).float().mean()))
     cluster_flip_rate = float(np.mean(flip_rates)) if flip_rates else 0.0
 
-    # ── 7. Subcluster flip rate ──────────────────────────────────────────────
+    # ── Cluster entropy over predicted assignments ────────────────────────────
+    counts = torch.bincount(
+        pred_centroid_idx.long(), minlength=len(final_centroid_ids)
+    ).float()
+    probs = counts / counts.sum().clamp(min=1e-12)
+    nz = probs[probs > 0]
+    cluster_entropy = float(-(nz * nz.log()).sum() / np.log(2))
+
+    # ── Subcluster flip rate (final-layer sub-centroids) ──────────────────────
     subcluster_flip_rate: Optional[float] = None
-    if (groups.token_to_sub is not None
-            and groups.subcluster_to_tokens is not None
-            and groups.sub_ids is not None
-            and len(groups.sub_ids) >= 2):
+    if (final_sub_centroids is not None
+            and final_sub_centroid_ids is not None
+            and groups.token_to_sub is not None
+            and len(final_sub_centroid_ids) >= 2):
 
-        # Build subcluster centroids
-        sub_centroid_list: List[torch.Tensor] = []
-        sub_centroid_ids:  List[int] = []
-        for sid in groups.sub_ids:
-            vecs = [token_means[t] for t in groups.subcluster_to_tokens[sid]
-                    if t in token_means]
-            if not vecs:
-                continue
-            sub_centroid_list.append(torch.stack(vecs).mean(dim=0))
-            sub_centroid_ids.append(sid)
+        fsc = final_sub_centroids.to(device)
+        sub_qualified = sorted(t for t in groups.token_to_sub if t in groups.token_to_idx)
+        if sub_qualified:
+            n_per_tok = [len(groups.token_to_idx[t]) for t in sub_qualified]
+            all_idx = np.concatenate([groups.token_to_idx[t] for t in sub_qualified])
+            h_sub = h[torch.from_numpy(all_idx).to(device)]
 
-        if len(sub_centroid_list) >= 2:
-            sub_centroids = torch.stack(sub_centroid_list)   # (M, D)
-
-            # Tokens that have both subcluster labels and sufficient occurrences
-            sub_qualified = sorted(
-                t for t in groups.token_to_sub if t in groups.token_to_idx
+            pred_sub_cidx = nearest_centroid_assign(h_sub, fsc)
+            pred_sub_ids = torch.tensor(
+                [final_sub_centroid_ids[i] for i in pred_sub_cidx.cpu().tolist()],
+                dtype=torch.long,
             )
-            if sub_qualified:
-                # Gather all their sample indices in a consistent order
-                n_per_tok = [len(groups.token_to_idx[t]) for t in sub_qualified]
-                all_idx = np.concatenate(
-                    [groups.token_to_idx[t] for t in sub_qualified]
-                )
-                h_sub = h[torch.from_numpy(all_idx).to(device)]   # (N_sub, D)
 
-                pred_sub_cidx = nearest_centroid_assign(h_sub, sub_centroids)
-                pred_sub_ids = torch.tensor(
-                    [sub_centroid_ids[i] for i in pred_sub_cidx.cpu().tolist()],
-                    dtype=torch.long,
-                )   # (N_sub,)
-
-                sub_flips: List[float] = []
-                offset = 0
-                for tok, n_t in zip(sub_qualified, n_per_tok):
-                    true_sub = groups.token_to_sub[tok]
-                    pred_tok = pred_sub_ids[offset : offset + n_t]
-                    offset  += n_t
-                    sub_flips.append(float((pred_tok != true_sub).float().mean()))
-                subcluster_flip_rate = float(np.mean(sub_flips))
+            sub_flips: List[float] = []
+            offset = 0
+            for tok, n_t in zip(sub_qualified, n_per_tok):
+                true_sub = groups.token_to_sub[tok]
+                pred_tok = pred_sub_ids[offset : offset + n_t]
+                offset  += n_t
+                sub_flips.append(float((pred_tok != true_sub).float().mean()))
+            subcluster_flip_rate = float(np.mean(sub_flips))
 
     return {
         "avg_norm":             round(avg_norm, 4),
-        "contextual_drift":     round(contextual_drift, 6),
-        "intra_cluster":        round(intra_cluster, 6),
-        "inter_cluster":        round(inter_cluster, 6),
+        "dist_A":               round(dist_A, 6),
+        "dist_B":               round(dist_B, 6),
+        "dist_C":               round(dist_C, 6),
         "cluster_flip_rate":    round(cluster_flip_rate, 6),
-        "subcluster_flip_rate": round(subcluster_flip_rate, 6) if subcluster_flip_rate is not None else None,
-        # Raw distances (before normalization) for reference
-        "contextual_drift_raw": round(contextual_drift_raw, 4),
-        "intra_cluster_raw":    round(intra_cluster_raw, 4),
-        "inter_cluster_raw":    round(inter_cluster_raw, 4),
+        "cluster_entropy":      round(cluster_entropy, 4),
+        "subcluster_flip_rate": (round(subcluster_flip_rate, 6)
+                                 if subcluster_flip_rate is not None else None),
     }
 
 
@@ -420,20 +498,20 @@ def plot_distances(all_metrics: Dict[int, dict], layers: List[int], output_dir: 
         return
 
     xlabels = [str(l) for l in layers]
-    drift = [all_metrics[l]["contextual_drift"] for l in layers]
-    intra = [all_metrics[l]["intra_cluster"]    for l in layers]
-    inter = [all_metrics[l]["inter_cluster"]    for l in layers]
+    dist_A = [all_metrics[l]["dist_A"] for l in layers]
+    dist_B = [all_metrics[l]["dist_B"] for l in layers]
+    dist_C = [all_metrics[l]["dist_C"] for l in layers]
 
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(xlabels, inter, "o-",  color="tab:red",    lw=2.5, label="inter-cluster (centroid separation)")
-    ax.plot(xlabels, intra, "s--", color="tab:blue",   lw=2,   label="intra-cluster (token-mean spread)")
-    ax.plot(xlabels, drift, "^:",  color="tab:green",  lw=1.5, label="contextual drift (same-token variance)")
+    ax.plot(xlabels, dist_C, "o-",  color="tab:red",   lw=2.5, label="C — diff cluster")
+    ax.plot(xlabels, dist_B, "s--", color="tab:blue",  lw=2,   label="B — same cluster, diff token")
+    ax.plot(xlabels, dist_A, "^:",  color="tab:green", lw=1.5, label="A — same token (contextual drift)")
 
     ax.set_xlabel("Layer")
     ax.set_ylabel("L2 distance / avg hidden norm")
     ax.set_title(
-        "Distances vs layer  (normalized)\n"
-        "Expect: inter-cluster  ≫  intra-cluster  ≥  contextual drift"
+        "A/B/C pair distances vs layer  (normalized)\n"
+        "Expect: C  ≫  B  ≥  A"
     )
     ax.legend()
     ax.grid(alpha=0.3)
@@ -451,25 +529,34 @@ def plot_flip_rates(all_metrics: Dict[int, dict], layers: List[int], output_dir:
         return
 
     xlabels = [str(l) for l in layers]
-    c_flip = [all_metrics[l]["cluster_flip_rate"] for l in layers]
-    s_flip = [all_metrics[l]["subcluster_flip_rate"] for l in layers]
+    c_flip  = [all_metrics[l]["cluster_flip_rate"]  for l in layers]
+    s_flip  = [all_metrics[l]["subcluster_flip_rate"] for l in layers]
+    entropy = [all_metrics[l]["cluster_entropy"]    for l in layers]
     has_sub = any(v is not None for v in s_flip)
 
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(xlabels, c_flip, "o-", color="tab:blue",   lw=2, label="cluster flip rate")
+    fig, ax1 = plt.subplots(figsize=(9, 5))
+    ax1.plot(xlabels, c_flip, "o-", color="tab:blue",   lw=2, label="cluster flip rate")
     if has_sub:
         s_vals = [v if v is not None else float("nan") for v in s_flip]
-        ax.plot(xlabels, s_vals, "s--", color="tab:orange", lw=2, label="subcluster flip rate")
+        ax1.plot(xlabels, s_vals, "s--", color="tab:orange", lw=2, label="subcluster flip rate")
+    ax1.set_xlabel("Layer")
+    ax1.set_ylabel("Flip rate")
+    ax1.set_ylim(-0.02, 1.02)
+    ax1.grid(alpha=0.3)
 
-    ax.set_xlabel("Layer")
-    ax.set_ylabel("Flip rate  (fraction of occurrences misclassified by nearest centroid)")
-    ax.set_title(
-        "Cluster flip rate vs layer\n"
+    ax2 = ax1.twinx()
+    ax2.plot(xlabels, entropy, "D:", color="tab:gray", lw=1.5, label="cluster entropy (bits)")
+    ax2.set_ylabel("Cluster entropy (bits)", color="tab:gray")
+    ax2.tick_params(axis="y", labelcolor="tab:gray")
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
+
+    ax1.set_title(
+        "Cluster flip rate vs layer  (final-layer centroids)\n"
         "Expect: cluster flip rate LOW, subcluster flip rate HIGHER"
     )
-    ax.legend()
-    ax.grid(alpha=0.3)
-    ax.set_ylim(-0.02, 1.02)
     fig.tight_layout()
 
     path = os.path.join(output_dir, "flip_rates_plot.png")
@@ -479,41 +566,38 @@ def plot_flip_rates(all_metrics: Dict[int, dict], layers: List[int], output_dir:
 
 
 def print_summary(all_metrics: Dict[int, dict], layers: List[int]) -> None:
-    sep = "=" * 66
+    sep = "=" * 82
     print(f"\n{sep}")
-    print("  CONTEXT vs CLUSTER — RESULTS")
+    print("  CONTEXT vs CLUSTER — RESULTS  (A=same token / B=same cluster / C=diff cluster)")
     print(sep)
-    print(f"  {'Layer':>6}  {'drift':>8}  {'intra':>8}  {'inter':>8}  "
-          f"{'c_flip':>8}  {'sc_flip':>9}  {'inter/intra':>12}")
-    print(f"  {'-'*6}  {'-'*8}  {'-'*8}  {'-'*8}  "
-          f"{'-'*8}  {'-'*9}  {'-'*12}")
+    print(f"  {'Layer':>6}  {'A (drift)':>10}  {'B (intra)':>10}  {'C (inter)':>10}  "
+          f"{'C/B':>8}  {'c_flip':>8}  {'sc_flip':>9}  {'entropy':>8}")
+    print(f"  {'-'*6}  {'-'*10}  {'-'*10}  {'-'*10}  "
+          f"{'-'*8}  {'-'*8}  {'-'*9}  {'-'*8}")
     for l in layers:
         m = all_metrics[l]
-        ratio = (m["inter_cluster"] / m["intra_cluster"]
-                 if m["intra_cluster"] > 0 else float("inf"))
+        ratio = m["dist_C"] / m["dist_B"] if m["dist_B"] > 0 else float("inf")
         sc = f"{m['subcluster_flip_rate']:.4f}" if m["subcluster_flip_rate"] is not None else "  N/A   "
-        print(f"  {l:>6}  {m['contextual_drift']:8.4f}  {m['intra_cluster']:8.4f}  "
-              f"{m['inter_cluster']:8.4f}  {m['cluster_flip_rate']:8.4f}  "
-              f"{sc:>9}  {ratio:12.2f}x")
+        print(f"  {l:>6}  {m['dist_A']:10.4f}  {m['dist_B']:10.4f}  {m['dist_C']:10.4f}  "
+              f"{ratio:7.2f}x  {m['cluster_flip_rate']:8.4f}  "
+              f"{sc:>9}  {m['cluster_entropy']:8.3f}")
     print()
 
-    # Interpretation
     last = all_metrics[layers[-1]]
-    first_inter_gt_intra = next(
-        (l for l in layers if all_metrics[l]["inter_cluster"] > all_metrics[l]["intra_cluster"]),
+    first_c_gt_b = next(
+        (l for l in layers if all_metrics[l]["dist_C"] > all_metrics[l]["dist_B"]),
         None,
     )
-    hierarchy_holds = (
-        last["inter_cluster"] > last["intra_cluster"] >= last["contextual_drift"]
-    )
+    hierarchy_holds = last["dist_C"] > last["dist_B"] >= last["dist_A"]
     flip_is_low = last["cluster_flip_rate"] < 0.15
 
     print("  INTERPRETATION (final layer):")
-    print(f"    inter > intra >= drift hierarchy:  {'YES' if hierarchy_holds else 'NO'}")
-    if first_inter_gt_intra is not None:
-        print(f"    First layer where inter > intra:   Layer {first_inter_gt_intra}")
+    print(f"    C > B >= A hierarchy:              {'YES' if hierarchy_holds else 'NO'}")
+    if first_c_gt_b is not None:
+        print(f"    First layer where C > B:           Layer {first_c_gt_b}")
     print(f"    Cluster flip rate (final):         {last['cluster_flip_rate']:.3f}  "
           f"({'LOW — clusters are stable' if flip_is_low else 'HIGH — context crosses cluster boundaries'})")
+    print(f"    Cluster entropy (final):           {last['cluster_entropy']:.3f} bits")
     if last["subcluster_flip_rate"] is not None:
         sc_higher = last["subcluster_flip_rate"] > last["cluster_flip_rate"]
         print(f"    Subcluster flip rate (final):      {last['subcluster_flip_rate']:.3f}  "
@@ -550,12 +634,16 @@ def main() -> None:
                         default="interference_experiment/results/context_vs_cluster")
     parser.add_argument("--min_occurrences", type=int, default=20,
                         help="Minimum occurrences per token to include in analysis")
-    parser.add_argument("--seed",           type=int, default=42)
+    parser.add_argument("--n_pairs",         type=int, default=10000,
+                        help="Pairs to sample per A/B/C condition per layer")
+    parser.add_argument("--normalize",       action="store_true",
+                        help="L2-normalize hidden states before computing distances")
+    parser.add_argument("--seed",            type=int, default=42)
     args = parser.parse_args()
 
     _setup_logging()
+    rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -573,30 +661,72 @@ def main() -> None:
     log.info("=== Building token groups (min_occurrences=%d) ===", args.min_occurrences)
     groups = TokenGroups(tokens, clusters, subcluster_arr, args.min_occurrences)
 
+    # ── Build final-layer centroids (fixed reference for flip rate) ──────────
+    final_layer = layers[-1]
+    log.info("=== Building final-layer centroids from layer %d ===", final_layer)
+    h_final_np = np.load(hidden_paths[final_layer])
+    final_centroids, final_centroid_ids = build_final_layer_centroids(
+        h_final_np, groups, device, normalize=args.normalize
+    )
+
+    # ── Build final-layer sub-centroids (if subcluster map available) ────────
+    final_sub_centroids: Optional[torch.Tensor] = None
+    final_sub_centroid_ids: Optional[List[int]] = None
+    if (groups.token_to_sub is not None
+            and groups.subcluster_to_tokens is not None
+            and groups.sub_ids is not None):
+        log.info("Building final-layer sub-centroids ...")
+        h_final = torch.from_numpy(h_final_np.astype(np.float32)).to(device)
+        if args.normalize:
+            h_final = h_final / h_final.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        sub_centroid_list: List[torch.Tensor] = []
+        sub_centroid_ids_: List[int] = []
+        for sid in groups.sub_ids:
+            tok_list = [t for t in groups.subcluster_to_tokens[sid]
+                        if t in groups.token_to_idx]
+            if not tok_list:
+                continue
+            mu_list = [h_final[torch.from_numpy(groups.token_to_idx[t]).to(device)].mean(dim=0)
+                       for t in tok_list]
+            sub_centroid_list.append(torch.stack(mu_list).mean(dim=0))
+            sub_centroid_ids_.append(sid)
+        if len(sub_centroid_list) >= 2:
+            final_sub_centroids    = torch.stack(sub_centroid_list)
+            final_sub_centroid_ids = sub_centroid_ids_
+        del h_final
+
+    del h_final_np
+
     # ── Per-layer analysis ──────────────────────────────────────────────────
-    log.info("=== Analyzing layers ===")
+    log.info(
+        "=== Analyzing layers (n_pairs=%d, normalize=%s) ===",
+        args.n_pairs, args.normalize,
+    )
     all_metrics: Dict[int, dict] = {}
 
     for l in layers:
         t0 = time.time()
         log.info("--- Layer %d ---", l)
-        h_np = np.load(hidden_paths[l])   # (N, D) float16
+        h_np = np.load(hidden_paths[l])
 
-        metrics = analyze_layer(h_np, groups, device)
-        del h_np   # free immediately
+        metrics = analyze_layer(
+            h_np, groups, clusters, final_centroids, final_centroid_ids,
+            final_sub_centroids, final_sub_centroid_ids,
+            device, args.n_pairs, args.normalize, rng,
+        )
+        del h_np
 
         elapsed = time.time() - t0
         sub_str = (f"{metrics['subcluster_flip_rate']:.4f}"
                    if metrics["subcluster_flip_rate"] is not None else "N/A")
         log.info(
-            "  drift=%.4f  intra=%.4f  inter=%.4f  "
-            "c_flip=%.4f  sc_flip=%s  ratio=%.1fx  (%.1fs)",
-            metrics["contextual_drift"],
-            metrics["intra_cluster"],
-            metrics["inter_cluster"],
+            "  A=%.4f  B=%.4f  C=%.4f  C/B=%.1fx  "
+            "c_flip=%.4f  sc_flip=%s  entropy=%.3f  (%.1fs)",
+            metrics["dist_A"], metrics["dist_B"], metrics["dist_C"],
+            metrics["dist_C"] / max(metrics["dist_B"], 1e-8),
             metrics["cluster_flip_rate"],
             sub_str,
-            metrics["inter_cluster"] / max(metrics["intra_cluster"], 1e-8),
+            metrics["cluster_entropy"],
             elapsed,
         )
         all_metrics[l] = metrics
