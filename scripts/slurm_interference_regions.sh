@@ -44,4 +44,6 @@ python ${PIPE}/run_all.py \
     --logit_ks         10 50 100 500 \
     --r_values         1 2 4 8 \
     --n_routed_eval    5000 \
-    --seed             42
+    --seed             42 \
+    --eval_leaf_regions \
+    --leaf_r_values    1 2 4 8 16 32

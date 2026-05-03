@@ -8,6 +8,7 @@ End-to-end interference region pipeline:
   Step 2: cluster_regions           — Leiden / Louvain community detection
   Step 3: recursive_subcluster      — subcluster large regions
   Step 4: evaluate_regions          — probes, logit locality, gold recall, PPL
+  Step 5: leaf_region_eval          — evaluate leaf nodes as routing units (opt-in: --eval_leaf_regions)
 
 Usage:
   python run_all.py [--skip_steps 1 2] [all other args]
@@ -27,13 +28,14 @@ import build_interference_graph as _build
 import cluster_regions          as _cluster
 import recursive_subcluster     as _subcluster
 import evaluate_regions         as _eval
+import leaf_region_eval         as _leaf_eval
 from utils import setup_logging, set_seed
 
 log = setup_logging("run_all")
 
 
 def run_step(name: str, fn, args, skip: set) -> None:
-    step_n = {"build": 1, "cluster": 2, "subcluster": 3, "evaluate": 4}[name]
+    step_n = {"build": 1, "cluster": 2, "subcluster": 3, "evaluate": 4, "leaf_eval": 5}[name]
     if step_n in skip:
         log.info("Skipping step %d (%s)", step_n, name)
         return
@@ -95,7 +97,20 @@ def build_step_args(args) -> tuple:
     evaluate.n_routed_eval   = args.n_routed_eval
     evaluate.seed            = args.seed
 
-    return build, cluster, subcluster, evaluate
+    leaf_eval = NS()
+    leaf_eval.region_tree_json = os.path.join(args.output_dir, "region_tree.json")
+    leaf_eval.probe_cache_dir  = os.path.join(args.output_dir, "probe_cache")
+    leaf_eval.output_dir       = os.path.join(args.output_dir, "leaf_region_eval")
+    leaf_eval.model_name       = args.model_name
+    leaf_eval.probe_layers     = args.probe_layers
+    leaf_eval.probe_epochs     = args.probe_epochs
+    leaf_eval.r_values         = args.leaf_r_values
+    leaf_eval.logit_ks         = args.logit_ks
+    leaf_eval.n_routed_eval    = args.n_routed_eval
+    leaf_eval.skip_softmax     = args.skip_leaf_softmax
+    leaf_eval.seed             = args.seed
+
+    return build, cluster, subcluster, evaluate, leaf_eval
 
 
 def main(args) -> None:
@@ -105,13 +120,15 @@ def main(args) -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.graphs_dir, exist_ok=True)
 
-    build_args, cluster_args, subcluster_args, eval_args = build_step_args(args)
+    build_args, cluster_args, subcluster_args, eval_args, leaf_eval_args = build_step_args(args)
 
     t_start = time.time()
     run_step("build",      _build.main,      build_args,      skip)
     run_step("cluster",    _cluster.main,    cluster_args,    skip)
     run_step("subcluster", _subcluster.main, subcluster_args, skip)
     run_step("evaluate",   _eval.main,       eval_args,       skip)
+    if args.eval_leaf_regions:
+        run_step("leaf_eval", _leaf_eval.main, leaf_eval_args, skip)
     log.info("Pipeline complete: %.1fs total", time.time() - t_start)
 
 
@@ -122,7 +139,7 @@ def parse_args():
     )
     # Pipeline control
     p.add_argument("--skip_steps",         type=int, nargs="*", default=[],
-                   help="Step numbers to skip: 1=build 2=cluster 3=subcluster 4=evaluate")
+                   help="Step numbers to skip: 1=build 2=cluster 3=subcluster 4=evaluate 5=leaf_eval")
 
     # Shared paths
     p.add_argument("--output_dir",         default="interference_region_pipeline/results")
@@ -162,6 +179,14 @@ def parse_args():
     p.add_argument("--logit_ks",           type=int,   nargs="+", default=[10, 50, 100, 500])
     p.add_argument("--r_values",           type=int,   nargs="+", default=[1, 2, 4, 8])
     p.add_argument("--n_routed_eval",      type=int,   default=5_000)
+
+    # Step 5: leaf region evaluation (optional)
+    p.add_argument("--eval_leaf_regions",  action="store_true",
+                   help="Run Step 5: evaluate leaf nodes of region tree as routing units")
+    p.add_argument("--leaf_r_values",      type=int,   nargs="+", default=[1, 2, 4, 8, 16, 32],
+                   help="r values for leaf gold-recall / softmax (wider range than coarse)")
+    p.add_argument("--skip_leaf_softmax",  action="store_true",
+                   help="Skip routed softmax simulation in leaf eval (faster, no model reload)")
 
     return p.parse_args()
 
