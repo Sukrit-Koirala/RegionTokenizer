@@ -95,9 +95,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--probe_lr", type=float, default=1e-3)
     p.add_argument("--probe_batch_size", type=int, default=2048)
 
+    # Soft routing
+    p.add_argument("--soft_routing_layer", type=int, default=47,
+                   help="Layer to use for soft routing eval (default: 47)")
+
     # Stage control
     p.add_argument("--stage", default="all",
-                   choices=["build_graph", "cluster", "cache_hidden", "eval", "all"])
+                   choices=["build_graph", "cluster", "cache_hidden", "eval",
+                            "soft_routing_eval", "all"])
 
     return p.parse_args()
 
@@ -1568,6 +1573,11 @@ def main() -> None:
 
     if run_all or args.stage == "eval":
         run_eval(args, device, out_dir)
+
+    if args.stage == "soft_routing_eval":
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from soft_routing_eval import run_soft_routing_eval
+        run_soft_routing_eval(args, device, out_dir)
 
     log.info("=" * 60)
     log.info("Done.")
