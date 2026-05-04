@@ -37,7 +37,7 @@ from transformers import GPT2TokenizerFast
 # ── Config ────────────────────────────────────────────────────────────────────
 
 _MODES = ("baseline", "coarse", "coarse_leaf", "random_control", "oracle_coarse", "oracle",
-          "build_regions")
+          "build_regions", "soft_moe", "oracle_soft_moe", "random_soft_moe")
 
 
 @dataclass
@@ -93,6 +93,17 @@ class TrainConfig:
     n_clusters: int = 50                   # coarse cluster count
     build_leaf: bool = True                # also build region_tree.json
     leaf_min_size: int = 30                # min tokens per leaf before recursing
+    # build_regions clustering control
+    region_cluster_method: str = "spectral"  # leiden | spectral | kmeans
+    target_n_regions: int = 128              # desired coarse region count
+    target_n_leaves: int = 512               # desired leaf count (guides subcluster fan-out)
+    extend_full_vocab: bool = False          # if True, build graph over all vocab tokens
+    # soft_moe / soft routing
+    router_temp: float = 2.0
+    prior_gamma: float = 1.0
+    prior_eps: float = 1e-6
+    learned_region_prior: bool = False
+    soft_topk_regions: int = 0              # 0 = full soft; >0 = top-k sparse routing
 
 
 # ── Transformer blocks ────────────────────────────────────────────────────────
@@ -449,6 +460,160 @@ class RegionConditionedTransformerLM(nn.Module):
                 "total": total, "non_emb": total - self.token_emb.weight.numel()}
 
 
+# ── Soft-MoE model ────────────────────────────────────────────────────────────
+
+class SoftMoETransformerLM(nn.Module):
+    """
+    Soft mixture-of-regions LM.
+
+      P(token | ctx)  ∝  exp( base_logits + γ · log(p_region @ M + ε) )
+
+    where M[r,v] = 1 if token v is in region r (precomputed, not learned by default).
+    Fully differentiable; no hard token-to-region decisions.
+
+    Modes handled:
+      soft_moe        — learned router
+      oracle_soft_moe — true target region as one-hot (upper bound)
+      random_soft_moe — same arch, random partition map (null hypothesis)
+    """
+
+    def __init__(
+        self,
+        cfg: TrainConfig,
+        vocab_size: int,
+        coarse_map: torch.Tensor,   # (vocab_size,) int64, -1 = unknown
+        membership: torch.Tensor,   # (n_coarse, vocab_size) float32
+    ):
+        super().__init__()
+        self.cfg        = cfg
+        self.vocab_size = vocab_size
+
+        self.register_buffer("coarse_map", coarse_map)
+        self.register_buffer("membership", membership)
+
+        self.token_emb = nn.Embedding(vocab_size, cfg.d_model)
+        self.pos_emb   = nn.Embedding(cfg.seq_len, cfg.d_model)
+        self.drop      = nn.Dropout(cfg.dropout)
+        self.blocks    = _make_blocks(cfg, cfg.n_layer)
+        self.ln_f      = nn.LayerNorm(cfg.d_model)
+        self.lm_head   = nn.Linear(cfg.d_model, vocab_size, bias=False)
+        self.token_emb.weight = self.lm_head.weight  # weight tying
+
+        self.coarse_head = _make_router_head(cfg.d_model, cfg.n_coarse,
+                                             cfg.dropout, cfg.router_type)
+        if cfg.learned_region_prior:
+            self.region_bias = nn.Parameter(torch.zeros(cfg.n_coarse, vocab_size))
+
+        self.apply(_init_weights)
+
+    # ------------------------------------------------------------------
+    def _get_membership(self) -> torch.Tensor:
+        if self.cfg.learned_region_prior:
+            return torch.sigmoid(self.region_bias)
+        return self.membership
+
+    def _compute_prior(self, p_region: torch.Tensor) -> torch.Tensor:
+        """p_region: (B, T, n_coarse) → log_prior: (B, T, vocab_size)"""
+        B, T, _ = p_region.shape
+        M   = self._get_membership()                               # (n_coarse, V)
+        rtp = p_region.reshape(B * T, self.cfg.n_coarse) @ M      # (B*T, V)
+        return torch.log(rtp + self.cfg.prior_eps).reshape(B, T, self.vocab_size)
+
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        idx: torch.Tensor,
+        oracle_region: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns: final_logits, region_logits, p_region, h"""
+        B, T = idx.shape
+        pos = torch.arange(T, device=idx.device).unsqueeze(0)
+        x = self.drop(self.token_emb(idx) + self.pos_emb(pos))
+        for block in self.blocks:
+            x = block(x)
+        h = self.ln_f(x)
+
+        base_logits   = self.lm_head(h)                            # (B, T, V)
+        region_logits = self.coarse_head(h)                        # (B, T, n_coarse)
+
+        if oracle_region is not None:
+            known    = oracle_region >= 0                          # (B, T)
+            p_region = torch.full(
+                (B, T, self.cfg.n_coarse), 1.0 / self.cfg.n_coarse, device=idx.device,
+            )
+            oh = F.one_hot(oracle_region.clamp(min=0),
+                           num_classes=self.cfg.n_coarse).float()
+            p_region = torch.where(known.unsqueeze(-1), oh, p_region)
+        else:
+            p_region = F.softmax(region_logits / self.cfg.router_temp, dim=-1)
+
+        # Optional top-k sparsification (not used in oracle mode)
+        if self.cfg.soft_topk_regions > 0 and oracle_region is None:
+            k = min(self.cfg.soft_topk_regions, self.cfg.n_coarse)
+            topk_vals, topk_idx = p_region.topk(k, dim=-1)
+            sparse_p = torch.zeros_like(p_region)
+            sparse_p.scatter_(-1, topk_idx, topk_vals)
+            p_region = sparse_p / (sparse_p.sum(dim=-1, keepdim=True) + 1e-8)
+
+        log_prior    = self._compute_prior(p_region)               # (B, T, V)
+        final_logits = base_logits + self.cfg.prior_gamma * log_prior
+        return final_logits, region_logits, p_region, h
+
+    # ------------------------------------------------------------------
+    def loss(self, idx: torch.Tensor) -> Dict[str, torch.Tensor]:
+        src = idx[:, :-1]
+        tgt = idx[:, 1:]
+
+        oracle_region = None
+        if self.cfg.mode == "oracle_soft_moe" and self.coarse_map is not None:
+            oracle_region = self.coarse_map[tgt]
+
+        final_logits, region_logits, p_region, _ = self.forward(src, oracle_region)
+
+        l_lm  = F.cross_entropy(final_logits.reshape(-1, self.vocab_size), tgt.reshape(-1))
+        total = l_lm
+        losses: Dict[str, torch.Tensor] = {"lm": l_lm}
+
+        if self.cfg.mode != "oracle_soft_moe" and self.coarse_map is not None:
+            coarse_labels = self.coarse_map[tgt]
+            valid = coarse_labels >= 0
+            if valid.any():
+                l_c = F.cross_entropy(
+                    region_logits.reshape(-1, self.cfg.n_coarse)[valid.reshape(-1)],
+                    coarse_labels.reshape(-1)[valid.reshape(-1)],
+                )
+                total = total + self.cfg.lambda_coarse * l_c
+                losses["coarse"] = l_c
+            p_c   = F.softmax(region_logits, dim=-1)
+            l_bal = -(p_c * (p_c + 1e-8).log()).sum(-1).mean().neg()
+            total = total + self.cfg.lambda_balance * l_bal
+            losses["balance_coarse"] = l_bal
+
+        losses["total"] = total
+        return losses
+
+    def param_count(self) -> int:
+        return sum(p.numel() for p in {id(p): p for p in self.parameters()}.values())
+
+    def param_breakdown(self) -> Dict[str, int]:
+        seen: set = set()
+        def _n(m: nn.Module) -> int:
+            c = 0
+            for p in m.parameters():
+                if id(p) not in seen:
+                    seen.add(id(p)); c += p.numel()
+            return c
+        emb    = _n(self.token_emb) + _n(self.pos_emb)
+        trunk  = sum(_n(b) for b in self.blocks) + _n(self.ln_f)
+        router = _n(self.coarse_head)
+        if self.cfg.learned_region_prior:
+            router += self.region_bias.numel()
+        _n(self.lm_head)
+        total = self.param_count()
+        return {"emb": emb, "trunk": trunk, "router": router, "refiner": 0,
+                "total": total, "non_emb": total - self.token_emb.weight.numel()}
+
+
 # ── Region map loaders ─────────────────────────────────────────────────────────
 
 def load_coarse_map(path: str, vocab_size: int) -> Tuple[torch.Tensor, int]:
@@ -499,6 +664,52 @@ def permute_map(arr: torch.Tensor, n_classes: int, seed: int) -> torch.Tensor:
     valid = arr >= 0
     out[valid] = perm[arr[valid]]
     return out
+
+
+def make_random_partition_map(arr: torch.Tensor, n_classes: int, seed: int) -> torch.Tensor:
+    """
+    True random partition: shuffles labeled tokens across regions while preserving
+    per-region size counts.  Destroys structural assignment (semantically similar
+    tokens no longer share a region) while keeping class imbalance identical.
+    This is a stronger null hypothesis than label permutation.
+    """
+    labeled_mask = arr >= 0
+    labeled_idx  = torch.where(labeled_mask)[0]
+    region_sizes = [(arr == r).sum().item() for r in range(n_classes)]
+
+    rng = torch.Generator()
+    rng.manual_seed(seed)
+    shuffled_idx = labeled_idx[torch.randperm(len(labeled_idx), generator=rng)]
+
+    out = arr.clone()
+    out[labeled_mask] = -1
+    offset = 0
+    for r, size in enumerate(region_sizes):
+        if size == 0 or offset >= len(shuffled_idx):
+            continue
+        end = min(offset + int(size), len(shuffled_idx))
+        out[shuffled_idx[offset:end]] = r
+        offset = end
+    return out
+
+
+def build_membership_matrix(
+    coarse_map: torch.Tensor, n_coarse: int, vocab_size: int,
+) -> torch.Tensor:
+    """
+    Build (n_coarse, vocab_size) float32 membership matrix.
+    M[r, v] = 1 if token v is in region r.
+    Unknown tokens (map == -1) get 1/n_coarse in every row so the soft prior
+    is uniform (neutral) for them — no routing bias for unseen tokens.
+    """
+    M = torch.zeros(n_coarse, vocab_size, dtype=torch.float32, device=coarse_map.device)
+    known     = coarse_map >= 0
+    known_idx = torch.where(known)[0]
+    M[coarse_map[known_idx], known_idx] = 1.0
+    unknown_idx = torch.where(~known)[0]
+    if len(unknown_idx) > 0:
+        M[:, unknown_idx] = 1.0 / n_coarse
+    return M
 
 
 # ── Dataset ────────────────────────────────────────────────────────────────────
@@ -592,6 +803,7 @@ def evaluate(
     l_acc32: List[float] = []
     c_ent:   List[float] = []
     l_ent:   List[float] = []
+    cov_c:   List[float] = []  # coarse target coverage (fraction of targets with known region)
 
     for i, batch in enumerate(loader):
         if i >= max_batches:
@@ -625,24 +837,40 @@ def evaluate(
                 l_acc32.append(topk_accuracy(fl, lb, 32))
                 l_ent.append(mean_entropy(fl))
 
+        elif isinstance(model, SoftMoETransformerLM):
+            with ctx:
+                _, region_logits, _, _ = model.forward(src)
+            if coarse_map is not None:
+                fl = region_logits.reshape(-1, cfg.n_coarse)
+                lb = coarse_map[tgt].reshape(-1)
+                c_acc1.append(topk_accuracy(fl, lb, 1))
+                c_acc4.append(topk_accuracy(fl, lb, 4))
+                c_ent.append(mean_entropy(fl))
+
+        # Coverage: fraction of next-token targets that have a known coarse region
+        if coarse_map is not None:
+            lb = coarse_map[tgt].reshape(-1)
+            cov_c.append((lb >= 0).float().mean().item())
+
     def avg(lst: list) -> float:
         return float(np.mean(lst)) if lst else 0.0
 
     lm = avg(lm_vals)
     out: Dict[str, float] = {
-        "val_lm_loss":     lm,
-        "val_ppl":         math.exp(min(lm, 20.0)),
-        "val_aux_coarse":  avg(aux_c),
-        "val_aux_leaf":    avg(aux_l),
-        "val_coarse_acc1": avg(c_acc1),
-        "val_coarse_acc4": avg(c_acc4),
-        "val_leaf_acc1":   avg(l_acc1),
-        "val_leaf_acc8":   avg(l_acc8),
-        "val_leaf_acc32":  avg(l_acc32),
-        "val_coarse_ent":  avg(c_ent),
-        "val_leaf_ent":    avg(l_ent),
-        "current_alpha":   getattr(model, "current_alpha", 0.0),
-        "current_beta":    getattr(model, "current_beta",  0.0),
+        "val_lm_loss":          lm,
+        "val_ppl":              math.exp(min(lm, 20.0)),
+        "val_aux_coarse":       avg(aux_c),
+        "val_aux_leaf":         avg(aux_l),
+        "val_coarse_acc1":      avg(c_acc1),
+        "val_coarse_acc4":      avg(c_acc4),
+        "val_leaf_acc1":        avg(l_acc1),
+        "val_leaf_acc8":        avg(l_acc8),
+        "val_leaf_acc32":       avg(l_acc32),
+        "val_coarse_ent":       avg(c_ent),
+        "val_leaf_ent":         avg(l_ent),
+        "val_coarse_coverage":  avg(cov_c),
+        "current_alpha":        getattr(model, "current_alpha", 0.0),
+        "current_beta":         getattr(model, "current_beta",  0.0),
     }
     return out
 
@@ -690,21 +918,21 @@ def train(cfg: TrainConfig):
     if cfg.mode != "baseline" and cfg.region_map_path:
         raw_coarse, n_coarse_actual = load_coarse_map(cfg.region_map_path, vocab_size)
         cfg.n_coarse = n_coarse_actual
-        if cfg.mode == "random_control":
-            raw_coarse = permute_map(raw_coarse, cfg.n_coarse, seed=cfg.seed)
+        if cfg.mode in ("random_control", "random_soft_moe"):
+            raw_coarse = make_random_partition_map(raw_coarse, cfg.n_coarse, seed=cfg.seed)
         coarse_map = raw_coarse.to(device)
         cov = (raw_coarse >= 0).float().mean().item()
-        tag = " (PERMUTED)" if cfg.mode == "random_control" else ""
+        tag = " (RANDOM PARTITION)" if cfg.mode in ("random_control", "random_soft_moe") else ""
         print(f"[region] coarse: {n_coarse_actual} regions  {cov:.1%} coverage{tag}")
 
     if cfg.mode in ("coarse_leaf", "random_control", "oracle") and cfg.leaf_map_path:
         raw_leaf, n_leaf_actual = load_leaf_map(cfg.leaf_map_path, vocab_size)
         cfg.n_leaf = n_leaf_actual
         if cfg.mode == "random_control":
-            raw_leaf = permute_map(raw_leaf, cfg.n_leaf, seed=cfg.seed + 1)
+            raw_leaf = make_random_partition_map(raw_leaf, cfg.n_leaf, seed=cfg.seed + 1)
         leaf_map = raw_leaf.to(device)
         cov = (raw_leaf >= 0).float().mean().item()
-        tag = " (PERMUTED)" if cfg.mode == "random_control" else ""
+        tag = " (RANDOM PARTITION)" if cfg.mode == "random_control" else ""
         print(f"[region] leaf:   {n_leaf_actual} leaves    {cov:.1%} coverage{tag}")
 
     # ── Datasets ───────────────────────────────────────────────────────────────
@@ -722,6 +950,11 @@ def train(cfg: TrainConfig):
     # ── Model ──────────────────────────────────────────────────────────────────
     if cfg.mode == "baseline":
         model: nn.Module = BaselineTransformerLM(cfg, vocab_size)
+    elif cfg.mode in ("soft_moe", "oracle_soft_moe", "random_soft_moe"):
+        assert coarse_map is not None, f"{cfg.mode} requires --region_map_path"
+        membership = build_membership_matrix(coarse_map, cfg.n_coarse, vocab_size)
+        model = SoftMoETransformerLM(cfg, vocab_size, coarse_map=coarse_map,
+                                     membership=membership)
     else:
         model = RegionConditionedTransformerLM(
             cfg, vocab_size, coarse_map=coarse_map, leaf_map=leaf_map,
@@ -977,7 +1210,7 @@ def build_regions(cfg: TrainConfig):
     print(f"[build_regions] {len(train_tokens):,} training tokens")
 
     # ── Frequent token subset ─────────────────────────────────────────────────
-    n_graph  = cfg.region_vocab_size
+    n_graph  = len(tokenizer) if cfg.extend_full_vocab else cfg.region_vocab_size
     tok_freq = np.bincount(train_tokens.astype(np.int64), minlength=vocab_size)
     freq_ids = np.argsort(tok_freq)[-n_graph:][::-1].astype(np.int32)
     np.save(os.path.join(out_dir, "frequent_token_ids.npy"), freq_ids)
@@ -1050,49 +1283,89 @@ def build_regions(cfg: TrainConfig):
     W_sym = W
     print(f"[build_regions] W density={(W_sym > 0).mean():.3%}")
 
-    # ── Clustering helper ─────────────────────────────────────────────────────
-    def _cluster(W_sub: np.ndarray, n_clus: int, seed: int) -> np.ndarray:
+    # ── Clustering helpers ────────────────────────────────────────────────────
+    def _spectral(W_sub: np.ndarray, n_clus: int, seed: int) -> np.ndarray:
+        from sklearn.cluster import SpectralClustering
         n = W_sub.shape[0]
+        sc = SpectralClustering(
+            n_clusters=n_clus, affinity="precomputed",
+            random_state=seed, n_jobs=-1, assign_labels="cluster_qr",
+        )
+        return sc.fit_predict(W_sub + 1e-10 * np.eye(n)).astype(np.int32)
+
+    def _kmeans(W_sub: np.ndarray, n_clus: int, seed: int) -> np.ndarray:
+        from sklearn.decomposition import TruncatedSVD
+        from sklearn.cluster import KMeans
+        n      = W_sub.shape[0]
+        n_comp = min(n_clus * 2, n - 1, 64)
+        emb    = TruncatedSVD(n_components=n_comp, random_state=seed).fit_transform(W_sub)
+        return (KMeans(n_clusters=n_clus, random_state=seed, n_init=10)
+                .fit_predict(emb).astype(np.int32))
+
+    def _leiden_targeted(W_sub: np.ndarray, n_target: int, seed: int) -> np.ndarray:
+        import igraph as ig
+        import leidenalg
+        n     = W_sub.shape[0]
+        W_coo = sp.csr_matrix(W_sub).tocoo()
+        mask  = (W_coo.row < W_coo.col) & (W_coo.data > 0)
+        if mask.sum() == 0:
+            return np.random.RandomState(seed).randint(0, n_target, n).astype(np.int32)
+        G = ig.Graph(n=n, directed=False)
+        G.add_edges(list(zip(W_coo.row[mask].tolist(), W_coo.col[mask].tolist())))
+        G.es["weight"] = W_coo.data[mask].tolist()
+        lo, hi, best = 0.0, 10.0, None
+        for _ in range(25):
+            mid  = (lo + hi) / 2
+            part = leidenalg.find_partition(
+                G, leidenalg.RBConfigurationVertexPartition,
+                weights="weight", seed=seed, resolution_parameter=mid,
+            )
+            n_found = len(set(part.membership))
+            if best is None or abs(n_found - n_target) < abs(len(set(best.membership)) - n_target):
+                best = part
+            if n_found < n_target * 0.9:
+                lo = mid
+            elif n_found > n_target * 1.1:
+                hi = mid
+            else:
+                break
+        return np.array(best.membership, dtype=np.int32)
+
+    def _cluster(W_sub: np.ndarray, n_clus: int, seed: int, top_level: bool = False) -> np.ndarray:
+        n      = W_sub.shape[0]
         if n <= n_clus:
             return np.arange(n, dtype=np.int32)
-
-        # Try Leiden
+        method = cfg.region_cluster_method if top_level else "spectral"
         try:
-            import igraph as ig
-            import leidenalg
-            W_coo = sp.csr_matrix(W_sub).tocoo()
-            mask  = (W_coo.row < W_coo.col) & (W_coo.data > 0)
-            if mask.sum() > 0:
-                G = ig.Graph(n=n, directed=False)
-                G.add_edges(list(zip(W_coo.row[mask].tolist(),
-                                     W_coo.col[mask].tolist())))
-                G.es["weight"] = W_coo.data[mask].tolist()
-                part = leidenalg.find_partition(
-                    G, leidenalg.RBConfigurationVertexPartition,
-                    weights="weight", seed=seed,
-                )
-                return np.array(part.membership, dtype=np.int32)
-        except Exception:
-            pass
-
-        # Fallback: SpectralClustering
-        try:
-            from sklearn.cluster import SpectralClustering
-            sc = SpectralClustering(
-                n_clusters=n_clus, affinity="precomputed",
-                random_state=seed, n_jobs=-1, assign_labels="cluster_qr",
-            )
-            return sc.fit_predict(W_sub + 1e-10 * np.eye(n)).astype(np.int32)
-        except Exception:
-            pass
-
-        # Last resort: random
-        return np.random.RandomState(seed).randint(0, n_clus, n).astype(np.int32)
+            if method == "leiden":
+                return _leiden_targeted(W_sub, n_clus, seed)
+            elif method == "kmeans":
+                return _kmeans(W_sub, n_clus, seed)
+            else:
+                return _spectral(W_sub, n_clus, seed)
+        except Exception as e:
+            print(f"[build_regions] clustering failed ({e}), falling back to random")
+            return np.random.RandomState(seed).randint(0, n_clus, n).astype(np.int32)
 
     # ── Coarse clustering ─────────────────────────────────────────────────────
-    coarse_labels = _cluster(W_sym, cfg.n_clusters, cfg.seed)
+    n_target      = cfg.target_n_regions if cfg.target_n_regions > 0 else cfg.n_clusters
+    coarse_labels = _cluster(W_sym, n_target, cfg.seed, top_level=True)
     n_coarse      = int(coarse_labels.max()) + 1
-    print(f"[build_regions] coarse: {n_coarse} regions")
+    sizes         = np.bincount(coarse_labels)
+    print(f"[build_regions] coarse: {n_coarse} regions  "
+          f"(target={n_target}  median={int(np.median(sizes))}  "
+          f"min={int(sizes.min())}  max={int(sizes.max())})")
+    with open(os.path.join(out_dir, "region_stats.json"), "w") as f:
+        json.dump({
+            "actual_n_regions": int(n_coarse),
+            "target_n_regions": int(n_target),
+            "region_cluster_method": cfg.region_cluster_method,
+            "median_size": float(np.median(sizes)),
+            "mean_size":   float(sizes.mean()),
+            "max_size":    int(sizes.max()),
+            "min_size":    int(sizes.min()),
+            "coverage":    float((coarse_labels >= 0).mean()),
+        }, f, indent=2)
 
     token_to_region: Dict[str, int] = {
         str(int(freq_ids[i])): int(coarse_labels[i]) for i in range(n_graph)
@@ -1112,7 +1385,8 @@ def build_regions(cfg: TrainConfig):
         if depth == 0 or len(sub_indices) < cfg.leaf_min_size * 2:
             return node
         W_sub   = W_sym[np.ix_(sub_indices, sub_indices)]
-        n_sub_c = max(2, min(8, len(sub_indices) // cfg.leaf_min_size))
+        leaves_per_region = max(2, cfg.target_n_leaves // max(1, n_coarse))
+        n_sub_c = max(2, min(leaves_per_region, len(sub_indices) // cfg.leaf_min_size))
         try:
             sub_labels = _cluster(W_sub, n_sub_c, cfg.seed + int(sub_indices[0]))
         except Exception:
@@ -1201,9 +1475,20 @@ def _parse_args() -> TrainConfig:
     p.add_argument("--region_top_k",      type=int,   default=20)
     p.add_argument("--region_max_tokens", type=int,   default=500_000)
     p.add_argument("--n_clusters",        type=int,   default=50)
-    p.add_argument("--no_leaf",           action="store_true",
+    p.add_argument("--no_leaf",              action="store_true",
                    help="Skip recursive subcluster / region_tree.json")
-    p.add_argument("--leaf_min_size",     type=int,   default=30)
+    p.add_argument("--leaf_min_size",        type=int,   default=30)
+    p.add_argument("--region_cluster_method", default="spectral",
+                   choices=["leiden", "spectral", "kmeans"])
+    p.add_argument("--target_n_regions",     type=int,   default=128)
+    p.add_argument("--target_n_leaves",      type=int,   default=512)
+    p.add_argument("--extend_full_vocab",    action="store_true")
+    # soft_moe / soft routing
+    p.add_argument("--router_temp",          type=float, default=2.0)
+    p.add_argument("--prior_gamma",          type=float, default=1.0)
+    p.add_argument("--prior_eps",            type=float, default=1e-6)
+    p.add_argument("--learned_region_prior", action="store_true")
+    p.add_argument("--soft_topk_regions",    type=int,   default=0)
     a = p.parse_args()
     return TrainConfig(
         dataset=a.dataset, seq_len=a.seq_len, batch_size=a.batch_size,
@@ -1231,6 +1516,15 @@ def _parse_args() -> TrainConfig:
         n_clusters=a.n_clusters,
         build_leaf=not a.no_leaf,
         leaf_min_size=a.leaf_min_size,
+        region_cluster_method=a.region_cluster_method,
+        target_n_regions=a.target_n_regions,
+        target_n_leaves=a.target_n_leaves,
+        extend_full_vocab=a.extend_full_vocab,
+        router_temp=a.router_temp,
+        prior_gamma=a.prior_gamma,
+        prior_eps=a.prior_eps,
+        learned_region_prior=a.learned_region_prior,
+        soft_topk_regions=a.soft_topk_regions,
     )
 
 
