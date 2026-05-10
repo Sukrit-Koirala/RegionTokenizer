@@ -41,6 +41,7 @@ _MODES = ("baseline", "coarse", "coarse_leaf", "random_control", "oracle_coarse"
           "repr_region", "oracle_repr_region", "random_repr_region",
           "repr_region_capacity", "oracle_repr_region_capacity", "random_repr_region_capacity",
           "repr_region_boundary", "oracle_repr_region_boundary", "random_repr_region_boundary",
+          "repr_region_multihyp", "oracle_repr_region_multihyp", "random_repr_region_multihyp",
           "boundary_analysis")
 
 
@@ -121,6 +122,8 @@ class TrainConfig:
     boundary_tau: float = 0.10            # margin threshold separating boundary from core
     boundary_temp: float = 0.05           # sigmoid gate temperature
     boundary_mode: str = "margin"         # "margin" | "entropy"
+    # repr_region_multihyp mode
+    hyp_k: int = 4                        # number of top-k hypotheses to preserve
     # boundary_analysis mode
     repr_ckpt: Optional[str] = None        # trained repr_region checkpoint to analyse
     max_analysis_batches: int = 200        # val batches to process (0 = all)
@@ -1131,6 +1134,231 @@ class ReprRegionBoundaryLM(nn.Module):
                 "total": total, "non_emb": total - self.token_emb.weight.numel()}
 
 
+# ── Boundary refiner ───────────────────────────────────────────────────────────
+
+class BoundaryRefiner(nn.Module):
+    """Small shared MLP applied independently to each latent hypothesis.
+    Residual-connected so it can be initialised as identity."""
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, d_model, bias=False),
+            nn.GELU(),
+            nn.Linear(d_model, d_model, bias=False),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.net(x)
+
+
+# ── Repr-Region-MultiHyp model ─────────────────────────────────────────────────
+
+class ReprRegionMultiHypLM(nn.Module):
+    """
+    Uncertainty-preserving latent refinement near region boundaries.
+
+    For each token the router computes routing margin = top1 − top2.
+    A sigmoid gate converts low margin (ambiguous) to high gate value.
+
+    Core path  (gate ≈ 0, confident tokens):
+        r_soft   = p_region @ region_emb.weight        (soft mixture)
+        h_core   = h + alpha_core * region_proj(region_mlp(r_soft))
+
+    Multi-hypothesis path  (gate ≈ 1, boundary tokens):
+        For i = 1..hyp_k:
+            h_i   = h + alpha_boundary * region_proj(region_mlp(region_emb[topk_idx_i]))
+            h_i'  = BoundaryRefiner(h_i)               (shared, lightweight)
+        h_bnd = Σ_i  topk_norm_prob_i * h_i'           (probability-weighted merge)
+
+    Final blend:
+        h_final = (1 − gate) * h_core + gate * h_bnd
+
+    Key design principle: hypotheses are kept SEPARATE through the refiner so
+    that each latent manifold can evolve independently before recombination.
+    Naive soft averaging before refinement destroys this information.
+    """
+
+    def __init__(
+        self,
+        cfg: TrainConfig,
+        vocab_size: int,
+        coarse_map: torch.Tensor,
+    ):
+        super().__init__()
+        self.cfg        = cfg
+        self.vocab_size = vocab_size
+
+        self.register_buffer("coarse_map", coarse_map)
+        self.current_alpha: float = cfg.alpha_core
+        self.warmup_scale:  float = 1.0
+
+        self.token_emb = nn.Embedding(vocab_size, cfg.d_model)
+        self.pos_emb   = nn.Embedding(cfg.seq_len, cfg.d_model)
+        self.drop      = nn.Dropout(cfg.dropout)
+        self.blocks    = _make_blocks(cfg, cfg.n_layer)
+        self.ln_f      = nn.LayerNorm(cfg.d_model)
+
+        self.coarse_head  = _make_router_head(cfg.d_model, cfg.n_coarse,
+                                              cfg.dropout, cfg.router_type)
+        self.region_emb   = nn.Embedding(cfg.n_coarse, cfg.d_region)
+        self.region_mlp   = FFN(cfg.d_region, cfg.d_region * 2, dropout=0.0)
+        self.region_proj  = nn.Linear(cfg.d_region, cfg.d_model, bias=False)
+        self.hyp_refiner  = BoundaryRefiner(cfg.d_model)
+
+        self.lm_head = nn.Linear(cfg.d_model, vocab_size, bias=False)
+        self.token_emb.weight = self.lm_head.weight  # weight tying
+        self.apply(_init_weights)
+
+        self._last_gate:      Optional[torch.Tensor] = None
+        self._last_alpha_dyn: Optional[torch.Tensor] = None
+
+    def set_region_scales(self, alpha: float, beta: float = 0.0):
+        self.warmup_scale  = min(1.0, alpha / max(self.cfg.alpha_core, 1e-8))
+        self.current_alpha = alpha
+
+    def _boundary_gate(self, p_region: torch.Tensor) -> torch.Tensor:
+        """Sigmoid gate ∈ [0,1] per (B,T). 1 = boundary, 0 = core."""
+        top2   = p_region.topk(2, dim=-1).values       # (B, T, 2)
+        margin = top2[..., 0] - top2[..., 1]           # (B, T)
+        return torch.sigmoid(
+            (self.cfg.boundary_tau - margin) / self.cfg.boundary_temp
+        )
+
+    def forward(
+        self,
+        idx: torch.Tensor,
+        oracle_region: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, T = idx.shape
+        pos = torch.arange(T, device=idx.device).unsqueeze(0)
+        x = self.drop(self.token_emb(idx) + self.pos_emb(pos))
+        for block in self.blocks:
+            x = block(x)
+        h = self.ln_f(x)                                    # (B, T, d_model)
+
+        region_logits = self.coarse_head(h)                 # (B, T, K)
+
+        if oracle_region is not None:
+            known    = oracle_region >= 0
+            p_region = torch.full(
+                (B, T, self.cfg.n_coarse), 1.0 / self.cfg.n_coarse, device=idx.device,
+            )
+            oh = F.one_hot(oracle_region.clamp(min=0),
+                           num_classes=self.cfg.n_coarse).float()
+            p_region = torch.where(known.unsqueeze(-1), oh, p_region)
+        else:
+            p_region = F.softmax(region_logits / self.cfg.router_temp, dim=-1)
+
+        # ── Gate ──────────────────────────────────────────────────────────────
+        # Detach p_region so gate-selection gradient does not leak back into
+        # the router. Without this, the LM loss flows through h_final → gate →
+        # margin → p_region and pushes the router toward uniform distributions
+        # (more boundary tokens), collapsing boundary_frac toward 1.0. The
+        # router is still trained by coarse auxiliary loss, balance loss, and
+        # LM loss through the region features — just not through gate selection.
+        gate      = self._boundary_gate(p_region.detach())  # (B, T)
+        gate_exp  = gate.unsqueeze(-1)                      # (B, T, 1)
+
+        # ── Core path: soft region mixture ────────────────────────────────────
+        ws = self.warmup_scale
+        r_soft   = p_region @ self.region_emb.weight        # (B, T, d_region)
+        core_feat = self.region_proj(self.region_mlp(r_soft))
+        h_core    = h + self.cfg.alpha_core * ws * core_feat
+
+        # ── Multi-hypothesis boundary path ────────────────────────────────────
+        K_h = min(self.cfg.hyp_k, self.cfg.n_coarse)
+        topk_out        = p_region.topk(K_h, dim=-1)
+        topk_probs_raw  = topk_out.values                   # (B, T, K_h)
+        topk_idx        = topk_out.indices                  # (B, T, K_h)
+
+        # Renormalise so weights sum to 1 for the K_h hypotheses
+        topk_probs = topk_probs_raw / (topk_probs_raw.sum(-1, keepdim=True) + 1e-8)
+
+        # Embed each hypothesis: (B, T, K_h) → (B, T, K_h, d_region)
+        hyp_emb = self.region_emb(topk_idx)                # (B, T, K_h, d_region)
+
+        # Pass through shared region_mlp + region_proj flattened to (B*T*K_h, ...)
+        flat_emb  = hyp_emb.reshape(B * T * K_h, self.cfg.d_region)
+        flat_feat = self.region_proj(self.region_mlp(flat_emb))  # (B*T*K_h, d_model)
+        hyp_feat  = flat_feat.reshape(B, T, K_h, self.cfg.d_model)
+
+        # h_i = h + alpha_boundary * region_feat_i  for each hypothesis i
+        h_exp  = h.unsqueeze(2).expand(-1, -1, K_h, -1)    # (B, T, K_h, d_model)
+        h_hyps = h_exp + self.cfg.alpha_boundary * ws * hyp_feat  # (B, T, K_h, d_model)
+
+        # Refine each hypothesis independently (shared lightweight MLP)
+        h_flat_ref = self.hyp_refiner(h_hyps.reshape(B * T * K_h, self.cfg.d_model))
+        h_refined  = h_flat_ref.reshape(B, T, K_h, self.cfg.d_model)
+
+        # Probability-weighted merge of refined hypotheses
+        h_bnd = (topk_probs.unsqueeze(-1) * h_refined).sum(dim=2)  # (B, T, d_model)
+
+        # ── Final blend ───────────────────────────────────────────────────────
+        h_final = (1.0 - gate_exp) * h_core + gate_exp * h_bnd
+
+        # Cache for eval per-group tracking (effective alpha for logging compat)
+        self._last_gate      = gate.detach().cpu()
+        self._last_alpha_dyn = (
+            self.cfg.alpha_core * (1.0 - gate) + self.cfg.alpha_boundary * gate
+        ).detach().cpu()
+
+        return self.lm_head(h_final), region_logits, p_region, h_final
+
+    def loss(self, idx: torch.Tensor) -> Dict[str, torch.Tensor]:
+        src = idx[:, :-1]
+        tgt = idx[:, 1:]
+
+        oracle_region = None
+        if self.cfg.mode == "oracle_repr_region_multihyp" and self.coarse_map is not None:
+            oracle_region = self.coarse_map[tgt]
+
+        lm_logits, region_logits, _, _ = self.forward(src, oracle_region)
+
+        l_lm  = F.cross_entropy(lm_logits.reshape(-1, self.vocab_size), tgt.reshape(-1))
+        total = l_lm
+        losses: Dict[str, torch.Tensor] = {"lm": l_lm}
+
+        if self.cfg.mode != "oracle_repr_region_multihyp" and self.coarse_map is not None:
+            coarse_labels = self.coarse_map[tgt]
+            valid = coarse_labels >= 0
+            if valid.any():
+                l_c = F.cross_entropy(
+                    region_logits.reshape(-1, self.cfg.n_coarse)[valid.reshape(-1)],
+                    coarse_labels.reshape(-1)[valid.reshape(-1)],
+                )
+                total = total + self.cfg.lambda_coarse * l_c
+                losses["coarse"] = l_c
+            p_c   = F.softmax(region_logits, dim=-1)
+            l_bal = -(p_c * (p_c + 1e-8).log()).sum(-1).mean().neg()
+            total = total + self.cfg.lambda_balance * l_bal
+            losses["balance_coarse"] = l_bal
+
+        losses["total"] = total
+        return losses
+
+    def param_count(self) -> int:
+        return sum(p.numel() for p in {id(p): p for p in self.parameters()}.values())
+
+    def param_breakdown(self) -> Dict[str, int]:
+        seen: set = set()
+        def _n(m: nn.Module) -> int:
+            c = 0
+            for p in m.parameters():
+                if id(p) not in seen:
+                    seen.add(id(p)); c += p.numel()
+            return c
+        emb      = _n(self.token_emb) + _n(self.pos_emb)
+        trunk    = sum(_n(b) for b in self.blocks) + _n(self.ln_f)
+        router   = (_n(self.coarse_head) + _n(self.region_emb)
+                    + _n(self.region_mlp) + _n(self.region_proj))
+        refiner  = _n(self.hyp_refiner)
+        _n(self.lm_head)   # weight-tied → 0
+        total    = self.param_count()
+        return {"emb": emb, "trunk": trunk, "router": router, "refiner": refiner,
+                "total": total, "non_emb": total - self.token_emb.weight.numel()}
+
+
 # ── Region map loaders ─────────────────────────────────────────────────────────
 
 def load_coarse_map(path: str, vocab_size: int) -> Tuple[torch.Tensor, int]:
@@ -1421,7 +1649,7 @@ def evaluate(
                 c_ent.append(mean_entropy(fl))
             usage_buf.append(p_region.detach().mean(dim=(0, 1)).cpu())
 
-        elif isinstance(model, ReprRegionBoundaryLM):
+        elif isinstance(model, (ReprRegionBoundaryLM, ReprRegionMultiHypLM)):
             with ctx:
                 lm_logits_bnd, region_logits, p_region, _ = model.forward(src)
             if coarse_map is not None:
@@ -1533,7 +1761,7 @@ def train(cfg: TrainConfig):
         cfg.n_coarse = n_coarse_actual
         _RANDOM_MODES = ("random_control", "random_soft_moe",
                          "random_repr_region", "random_repr_region_capacity",
-                         "random_repr_region_boundary")
+                         "random_repr_region_boundary", "random_repr_region_multihyp")
         if cfg.mode in _RANDOM_MODES:
             raw_coarse = make_random_partition_map(raw_coarse, cfg.n_coarse, seed=cfg.seed)
         coarse_map = raw_coarse.to(device)
@@ -1582,6 +1810,10 @@ def train(cfg: TrainConfig):
                       "random_repr_region_boundary"):
         assert coarse_map is not None, f"{cfg.mode} requires --region_map_path"
         model = ReprRegionBoundaryLM(cfg, vocab_size, coarse_map=coarse_map)
+    elif cfg.mode in ("repr_region_multihyp", "oracle_repr_region_multihyp",
+                      "random_repr_region_multihyp"):
+        assert coarse_map is not None, f"{cfg.mode} requires --region_map_path"
+        model = ReprRegionMultiHypLM(cfg, vocab_size, coarse_map=coarse_map)
     else:
         model = RegionConditionedTransformerLM(
             cfg, vocab_size, coarse_map=coarse_map, leaf_map=leaf_map,
@@ -1660,7 +1892,7 @@ def train(cfg: TrainConfig):
             else:
                 scale = min(1.0, step / cfg.region_warmup_steps)
             model.set_region_scales(cfg.base_alpha * scale, cfg.base_beta * scale)
-        elif isinstance(model, ReprRegionBoundaryLM):
+        elif isinstance(model, (ReprRegionBoundaryLM, ReprRegionMultiHypLM)):
             if cfg.region_warmup_steps <= 0:
                 scale = 1.0
             else:
@@ -1723,7 +1955,7 @@ def train(cfg: TrainConfig):
             _csv_writer.writerow(row)
             _csv_file.flush()
             _bnd_extra = ""
-            if isinstance(model, ReprRegionBoundaryLM) and val["val_boundary_frac"] > 0:
+            if isinstance(model, (ReprRegionBoundaryLM, ReprRegionMultiHypLM)) and val["val_boundary_frac"] > 0:
                 _bnd_extra = (
                     f"  bnd_lm={val['val_boundary_lm']:.4f}"
                     f"  core_lm={val['val_core_lm']:.4f}"
@@ -2665,7 +2897,10 @@ def _parse_args() -> TrainConfig:
     p.add_argument("--router_temp_final",      type=float, default=1.0)
     p.add_argument("--router_temp_decay_steps",type=int,   default=10000)
     # boundary_analysis
-    # repr_region_boundary
+    # repr_region_multihyp
+    p.add_argument("--hyp_k",          type=int,   default=4,
+                   help="Number of top-k latent hypotheses to preserve at boundary tokens")
+    # repr_region_boundary / repr_region_multihyp
     p.add_argument("--alpha_core",     type=float, default=0.2,
                    help="Alpha for high-margin (core) token conditioning")
     p.add_argument("--alpha_boundary", type=float, default=0.4,
@@ -2723,6 +2958,7 @@ def _parse_args() -> TrainConfig:
         router_temp_init=a.router_temp_init,
         router_temp_final=a.router_temp_final,
         router_temp_decay_steps=a.router_temp_decay_steps,
+        hyp_k=a.hyp_k,
         alpha_core=a.alpha_core,
         alpha_boundary=a.alpha_boundary,
         boundary_tau=a.boundary_tau,

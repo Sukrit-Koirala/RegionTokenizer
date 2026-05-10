@@ -1,0 +1,383 @@
+REGION TOKENIZER — CURRENT ARCHITECTURE
+========================================
+Written for personal reference. All numbers reflect the default config
+used in the wikitext-103 runs (K=128, d_model=384, n_layer=6, n_head=6,
+d_ff=1536, d_region=64, seq_len=256, batch_size=32).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SHARED BACKBONE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Every model in the codebase shares the same causal transformer trunk:
+
+  token_emb:  Embedding(vocab=50257, d=384)
+  pos_emb:    Embedding(seq=256,     d=384)
+  blocks:     6 × TransformerBlock
+  ln_f:       LayerNorm(384)
+  lm_head:    Linear(384 → 50257, no bias)
+
+  token_emb.weight == lm_head.weight   ← weight-tied always
+
+TransformerBlock:
+  LN → CausalSelfAttention → residual
+  LN → FFN(384 → 1536 → 384, GELU) → residual
+
+CausalSelfAttention:
+  QKV: Linear(384 → 3×384, no bias)
+  n_head=6, d_head=64, causal mask, dropout=0.1
+  output proj: Linear(384 → 384, no bias)
+
+The trunk takes token indices (B, T), returns hidden states h ∈ (B, T, 384).
+The baseline model is just this trunk followed by lm_head.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REGION MAP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Before any region model trains, you build a token-to-region map offline:
+
+1. Sweep the trained baseline over the corpus with torch.no_grad()
+2. For each position, record the top-50 predicted next tokens (co-activation)
+3. Build a weighted co-occurrence graph over the top-20k frequent tokens
+   W[i,j] = how often tokens i and j co-occur in the same top-50 prediction set
+   Normalised: W[i,j] /= sqrt(degree[i] * degree[j])
+4. Run spectral clustering on W to produce K=128 regions
+5. Save token_to_region.json: {token_id: region_id} for ~20k tokens
+
+The coarse_map tensor shape is (vocab_size=50257,) with dtype int64.
+Tokens not in the top-20k get value -1 (unknown / no region assignment).
+Coverage is typically ~40% of vocab but ~85-90% of actual corpus tokens
+because frequent tokens are well-covered.
+
+The map is fixed for all experiments. Regions represent semantic clusters —
+tokens that tend to predict each other, not tokens with similar surface form.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ROUTER HEAD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+All region models use the same router architecture (router_type=mlp):
+
+  LN(384) → Linear(384→384) → GELU → Dropout(0.1) → Linear(384→128)
+
+Takes h (B, T, 384) as input, outputs region_logits (B, T, 128).
+The router_type=linear variant is just a single Linear(384→128).
+
+The router is trained jointly with everything else, not pre-trained.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REGION FEATURE PIPELINE  (shared across all repr_region variants)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Once you have a routing distribution p_region ∈ (B, T, 128):
+
+  region_emb:   Embedding(128, d_region=64)
+  region_mlp:   FFN(64 → 128 → 64, GELU, dropout=0)
+  region_proj:  Linear(64 → 384, no bias)
+
+  r           = p_region @ region_emb.weight   # (B, T, 64)  — soft mixture
+  region_feat = region_proj(region_mlp(r))     # (B, T, 384)
+
+This is the "region feature" that gets injected into h. The soft mixture
+means every token gets a weighted blend of all 128 region embeddings,
+weighted by how strongly the router assigns each region.
+
+Why d_region=64 not 384? Keeps the embedding table small and forces the
+router to learn a compressed region representation before projecting up.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REPR_REGION  (the base experiment)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  h             = Transformer(ctx)              # (B, T, 384)
+  region_logits = router_head(h)                # (B, T, 128)
+  p_region      = softmax(region_logits / T)    # (B, T, 128)  T=2.0
+
+  r             = p_region @ region_emb.weight  # (B, T, 64)
+  region_feat   = region_proj(region_mlp(r))    # (B, T, 384)
+  h'            = h + alpha * region_feat        # alpha=0.2 after warmup
+  logits        = lm_head(h')                   # (B, T, 50257)
+
+Alpha warmup: linearly ramps 0 → 0.2 over 5000 steps so the router has
+time to learn meaningful routing before the injection becomes strong.
+
+Loss:
+  L_lm      = cross_entropy(logits, targets)
+  L_coarse  = cross_entropy(region_logits, true_region_of_target)
+  L_balance = -mean_entropy(p_region)   ← penalises routing collapse
+  L_total   = L_lm + 0.2*L_coarse + 0.001*L_balance
+
+L_coarse trains the router to predict which region the next token belongs to.
+L_balance (negative entropy) pushes the router to stay spread across regions
+at each individual position, preventing it from always routing to one region.
+
+Reference result: val_lm ≈ 3.9978 (vs baseline ≈ 4.00xx).
+
+Extra parameters vs baseline: ~100k (router head + region_emb + region_mlp
++ region_proj). Almost zero overhead.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REPR_REGION_CAPACITY  (anti-collapse experiment)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Hypothesis: the router collapses — a few dominant regions capture most
+tokens, making the region feature uninformative for rare regions.
+
+Three anti-collapse mechanisms stacked on top of repr_region:
+
+1. EMA USAGE TRACKING
+   region_usage_ema is a buffer, shape (128,), initialised to 1/128.
+   After each training batch:
+     batch_usage = p_region.mean(B, T)   ← mean routing weight per region
+     ema = 0.99*ema + 0.01*batch_usage
+
+2. CAPACITY PENALTY
+   Before softmax, subtract a log-usage bias from logits:
+     cap_bias = -capacity_alpha * log(ema + 1e-8)
+   High-usage regions get large bias → their logits are penalised → routing
+   redistributes to under-used regions.
+   capacity_alpha=0.5 in the main runs.
+
+3. DIVERSITY LOSS
+   usage = p_region.mean(B, T)   ← batch-level routing distribution
+   L_div = -H(usage)             ← negative entropy (minimise → maximise H)
+   Added to total loss with weight lambda_diversity=0.01.
+   This pushes the batch-level routing to be spread across all 128 regions.
+
+4. TEMPERATURE ANNEALING  (optional)
+   router_temp exponentially decays from 2.0 → 1.0 over 10k steps.
+   Lower temperature → sharper routing → harder assignments over time.
+
+The routing in this model is:
+  adjusted_logits = region_logits - capacity_alpha * log(ema + eps)
+  p_region = softmax(adjusted_logits / current_temp)
+
+Everything else (region feature, injection into h) is identical to repr_region.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REPR_REGION_BOUNDARY  (adaptive alpha experiment)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Hypothesis: routing failures are localised. Tokens near region boundaries
+(low routing confidence) need more conditioning; confident tokens are fine
+with less. The same alpha everywhere is wasteful.
+
+BOUNDARY GATE
+  p_region = softmax(region_logits / temp)
+  margin   = top1_prob - top2_prob       # (B, T), range [0, 1]
+  gate     = sigmoid((tau - margin) / boundary_temp)
+
+  With tau=0.10 and boundary_temp=0.05:
+    margin=0.00  → gate ≈ sigmoid(2.0)  = 0.88   (very boundary)
+    margin=0.10  → gate ≈ sigmoid(0.0)  = 0.50   (at threshold)
+    margin=0.40  → gate ≈ sigmoid(-6.0) = 0.002  (clearly core)
+
+  Entropy mode alternative (--boundary_mode entropy):
+    gate = H(p_region) / log(128)        # normalised entropy ∈ [0,1]
+
+DYNAMIC ALPHA
+  alpha_dyn = alpha_core*(1-gate) + alpha_boundary*gate
+            = 0.2*(1-gate) + 0.4*gate    # per (B, T) scalar
+  alpha_dyn *= warmup_scale              # ramps 0→1 over 5k steps
+
+FORWARD
+  r           = p_region @ region_emb.weight
+  region_feat = region_proj(region_mlp(r))
+  h'          = h + alpha_dyn.unsqueeze(-1) * region_feat
+
+The full soft distribution p_region is still used (no top-k masking).
+The only change is that boundary tokens get stronger conditioning.
+No extra parameters — alpha_dyn is computed from existing quantities.
+
+What changes vs repr_region:
+  - alpha is now per-token (0.2 for confident, 0.4 for boundary)
+  - gate computation adds ~4 ops per token (topk, subtract, sigmoid)
+  - everything else identical
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REPR_REGION_MULTIHYP  (current latest — multi-hypothesis refinement)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Hypothesis: boundary tokens should not collapse to one blended latent
+state. Instead, keep K separate candidate latent states (hypotheses),
+refine each independently, then merge. The merge timing matters: merging
+before refinement destroys the information; merging after preserves it.
+
+Same gate as repr_region_boundary.
+
+CORE PATH  (gate ≈ 0, confident tokens — identical to repr_region)
+  r_soft    = p_region @ region_emb.weight        # full soft mixture
+  core_feat = region_proj(region_mlp(r_soft))
+  h_core    = h + alpha_core * warmup_scale * core_feat
+
+MULTI-HYPOTHESIS BOUNDARY PATH  (gate ≈ 1, boundary tokens)
+
+  Step 1: extract K best regions
+    topk_probs, topk_idx = p_region.topk(K=4, dim=-1)  # (B, T, 4)
+    topk_probs /= topk_probs.sum(-1, keepdim=True)      # renormalise to sum=1
+
+  Step 2: embed each hypothesis separately
+    hyp_emb = region_emb(topk_idx)                      # (B, T, 4, 64)
+
+  Step 3: project through shared region_mlp + region_proj
+    Flatten to (B*T*4, 64), pass through mlp+proj, reshape back:
+    hyp_feat = region_proj(region_mlp(flat_emb))        # (B, T, 4, 384)
+
+  Step 4: build K separate hidden states
+    h_i = h + alpha_boundary * warmup_scale * hyp_feat_i
+    h_hyps: (B, T, 4, 384)    ← 4 independent perturbed states
+
+  Step 5: refine each independently (SHARED BoundaryRefiner)
+    BoundaryRefiner: x + Linear(384→384) → GELU → Linear(384→384)
+    Applied to (B*T*4, 384) — all hypotheses in one fused kernel call.
+    h_refined: (B, T, 4, 384)
+
+  Step 6: probability-weighted merge
+    h_bnd = sum_i( topk_probs_i * h_refined_i )         # (B, T, 384)
+
+FINAL BLEND
+  gate_exp = gate.unsqueeze(-1)                          # (B, T, 1)
+  h_final  = (1 - gate_exp) * h_core + gate_exp * h_bnd
+
+  logits = lm_head(h_final)
+
+WHY THE ORDER MATTERS
+  Old (naive avg first):
+    r_avg = (prob1*emb1 + prob2*emb2 + ...)   → one vector
+    h' = h + alpha * mlp(r_avg)
+    → hypotheses merged before any computation
+
+  New (compute first, merge later):
+    h_i = h + alpha * mlp(emb_i)             → K separate states
+    h_i' = refiner(h_i)                       → K refined states  ← KEY
+    h_bnd = sum_i(prob_i * h_i')             → merge after
+    → each hypothesis evolves independently before recombination
+
+  The difference: the refiner sees each hypothesis in isolation, so it can
+  adjust the state for "this token if it's in region 7" vs "this token if
+  it's in region 23" separately. With naive averaging, that distinction is
+  gone before any computation happens.
+
+BoundaryRefiner parameters:
+  2 × Linear(384, 384) = 2 × 384² = 294,912 params
+  This is the only extra module vs repr_region_boundary.
+
+Memory for K=4:
+  h_hyps + h_refined: 2 × (32 × 255 × 4 × 384) × 2 bytes ≈ 100 MB
+  Fine for L40s (48 GB).
+
+For K=8: roughly double the memory, still fine.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ORACLE AND RANDOM CONTROL VARIANTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Every mode has three variants:
+
+  learned (repr_region_*)
+    Router is a trained MLP. Learns from L_coarse supervision.
+
+  oracle (oracle_repr_region_*)
+    p_region is set to a one-hot of the TRUE next token's region.
+    The router is bypassed entirely — oracle_region = coarse_map[tgt].
+    L_coarse is skipped (no point supervising perfect routing).
+    This is the ceiling: "what if routing were perfect?"
+    Side effect: oracle margin = 1.0 always, so gate ≈ 0 in boundary/multihyp
+    models. The oracle path collapses to the core path with oracle routing.
+
+  random (random_repr_region_*)
+    The region map is shuffled before training:
+    make_random_partition_map() permutes token→region assignments while
+    preserving the per-region size distribution.
+    The router still trains (against shuffled labels), but now regions have
+    no semantic meaning. Should perform ≈ worse than learned but better
+    than baseline (extra params help slightly).
+    If random ≈ learned: the region structure doesn't matter, just the extra
+    capacity. If learned >> random: the semantic structure is the cause.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TRAINING DETAILS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Optimiser:  AdamW, lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1
+            Cosine decay after 1000 warmup steps.
+            Grad clip: 1.0
+
+AMP:        torch.autocast + GradScaler (float16 on GPU)
+
+Steps:      20,000
+
+Region warmup:
+  Steps 0→5000: alpha ramps linearly from 0 → alpha_core.
+  This prevents the router from disrupting early LM learning before
+  it has learned meaningful routing.
+
+Eval every 500 steps, save checkpoint every 2000 steps.
+Final eval uses max_batches=500 (full val set pass).
+
+CSV logs every 500 steps. Key fields:
+  val_lm_loss, val_ppl
+  val_coarse_acc1, val_coarse_acc4    ← router accuracy vs true region
+  val_coarse_ent                      ← routing entropy (higher = more spread)
+  val_usage_entropy, val_participation_ratio, val_region_gini  ← capacity runs
+  val_boundary_lm, val_core_lm        ← boundary/multihyp runs
+  val_boundary_frac                   ← fraction of positions with gate > 0.5
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EXPERIMENT LINEAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+baseline
+  → repr_region                  (representation conditioning works better than logit biasing)
+    → repr_region_capacity       (anti-collapse: EMA tracking + capacity penalty + diversity loss)
+    → repr_region_boundary       (adaptive alpha: stronger conditioning at ambiguous positions)
+    → repr_region_multihyp       (preserve K separate hypotheses, refine independently, merge late)
+
+Each step was motivated by boundary analysis showing where the previous
+architecture fails and what signal is still being lost.
+
+The common thread across all variants:
+  - Never hard-route (no top-1 argmax, no sparse masking)
+  - Region info injected at representation level, not logit level
+  - Soft distributions preserve gradient signal for rare regions
+  - Oracle vs random controls isolate what each mechanism actually buys
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PARAMETER COUNTS  (approximate, d_model=384, K=128, d_region=64)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Component               Params
+─────────────────────────────────────────────────────
+token_emb (tied)        50257 × 384 = 19.3M
+pos_emb                    256 × 384 = 98k
+6 transformer blocks       ~21.2M
+ln_f                          384 = 0.8k
+
+Subtotal backbone          ~40.6M
+
+router_head (mlp)        384×384 + 384×128 = 196k
+region_emb               128 × 64 = 8k
+region_mlp               64×128 + 128×64 = 16k
+region_proj              64 × 384 = 25k
+
+Subtotal router+region     ~245k
+
+BoundaryRefiner (multihyp only)
+                         384×384 × 2 = 295k
+
+lm_head                  weight-tied → 0 extra
+
+Total (repr_region):       ~40.85M
+Total (repr_region_multihyp): ~41.15M
