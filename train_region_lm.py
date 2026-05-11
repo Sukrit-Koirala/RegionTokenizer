@@ -42,6 +42,7 @@ _MODES = ("baseline", "coarse", "coarse_leaf", "random_control", "oracle_coarse"
           "repr_region_capacity", "oracle_repr_region_capacity", "random_repr_region_capacity",
           "repr_region_boundary", "oracle_repr_region_boundary", "random_repr_region_boundary",
           "repr_region_multihyp", "oracle_repr_region_multihyp", "random_repr_region_multihyp",
+          "repr_region_branchattn",
           "boundary_analysis")
 
 
@@ -124,6 +125,11 @@ class TrainConfig:
     boundary_mode: str = "margin"         # "margin" | "entropy"
     # repr_region_multihyp mode
     hyp_k: int = 4                        # number of top-k hypotheses to preserve
+    # repr_region_branchattn mode
+    branch_attn_heads: int = 4            # attention heads over K branch dimension
+    branch_attn_layers: int = 1           # stacked branch-attention layers
+    branch_attn_dropout: float = 0.1      # dropout inside BranchAttentionRefiner
+    branch_scale_init: float = 0.0        # initial value of tanh-gated residual scale
     # boundary_analysis mode
     repr_ckpt: Optional[str] = None        # trained repr_region checkpoint to analyse
     max_analysis_batches: int = 200        # val batches to process (0 = all)
@@ -1359,6 +1365,271 @@ class ReprRegionMultiHypLM(nn.Module):
                 "total": total, "non_emb": total - self.token_emb.weight.numel()}
 
 
+# ── Branch-Attention Refiner ──────────────────────────────────────────────────
+
+class _BranchAttnLayer(nn.Module):
+    """One Transformer-style layer operating over the K branch dimension."""
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.ln1  = nn.LayerNorm(d_model)
+        self.ln2  = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout,
+                                          batch_first=True, bias=False)
+        self.ffn  = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model, bias=False),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * d_model, d_model, bias=False),
+        )
+        self.drop = nn.Dropout(dropout)
+
+        # Zero-init both output projections so the layer starts as identity
+        nn.init.zeros_(self.attn.out_proj.weight)
+        nn.init.zeros_(self.ffn[-1].weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, K, d_model)  where N = B*T
+        x2 = self.ln1(x)
+        x2, _ = self.attn(x2, x2, x2, need_weights=False)
+        x = x + self.drop(x2)
+        x = x + self.drop(self.ffn(self.ln2(x)))
+        return x
+
+
+class BranchAttentionRefiner(nn.Module):
+    """
+    Attention over the K latent hypothesis dimension.
+
+    Input:  (B, T, K, d_model)
+    Output: (B, T, K, d_model)
+
+    Flattens B*T into the batch axis, treats K as the sequence axis for
+    self-attention.  A tanh-gated learnable scale (initialized to 0) keeps
+    the module near-identity at training onset.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, n_layers: int,
+                 dropout: float, scale_init: float):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            _BranchAttnLayer(d_model, n_heads, dropout)
+            for _ in range(n_layers)
+        ])
+        self.branch_scale = nn.Parameter(torch.tensor(float(scale_init)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, K, d_model)
+        B, T, K, D = x.shape
+        flat = x.reshape(B * T, K, D)           # (B*T, K, d_model)
+        delta = flat
+        for layer in self.layers:
+            delta = layer(delta)
+        delta = delta - flat                      # residual delta only
+        scale = torch.tanh(self.branch_scale)
+        out = flat + scale * delta
+        return out.reshape(B, T, K, D)
+
+
+class ReprRegionBranchAttnLM(nn.Module):
+    """
+    repr_region with boundary-gated multi-hypothesis branch attention.
+
+    Identical gating to repr_region_multihyp (detached p_region for gate),
+    but replaces the shared MLP BoundaryRefiner with BranchAttentionRefiner:
+    a lightweight Transformer over the K hypothesis dimension that lets
+    branches interact before probability-weighted merging.
+
+    Hypothesis: boundary uncertainty benefits from cross-branch interaction,
+    not just independent per-branch refinement.
+    """
+
+    def __init__(
+        self,
+        cfg: TrainConfig,
+        vocab_size: int,
+        coarse_map: torch.Tensor,
+    ):
+        super().__init__()
+        self.cfg        = cfg
+        self.vocab_size = vocab_size
+
+        self.register_buffer("coarse_map", coarse_map)
+        self.current_alpha: float = cfg.alpha_core
+        self.warmup_scale:  float = 1.0
+
+        self.token_emb = nn.Embedding(vocab_size, cfg.d_model)
+        self.pos_emb   = nn.Embedding(cfg.seq_len, cfg.d_model)
+        self.drop      = nn.Dropout(cfg.dropout)
+        self.blocks    = nn.ModuleList([
+            TransformerBlock(cfg.d_model, cfg.n_head, cfg.d_ff,
+                             cfg.seq_len, cfg.dropout)
+            for _ in range(cfg.n_layer)
+        ])
+        self.ln_f      = nn.LayerNorm(cfg.d_model)
+        self.lm_head   = nn.Linear(cfg.d_model, vocab_size, bias=False)
+        self.lm_head.weight = self.token_emb.weight   # weight tying
+
+        # Router
+        if cfg.router_type == "mlp":
+            self.coarse_head = nn.Sequential(
+                nn.Linear(cfg.d_model, cfg.d_model, bias=False),
+                nn.GELU(),
+                nn.Linear(cfg.d_model, cfg.n_coarse, bias=False),
+            )
+        else:
+            self.coarse_head = nn.Linear(cfg.d_model, cfg.n_coarse, bias=False)
+
+        # Region feature pipeline (shared by core and branch paths)
+        self.region_emb  = nn.Embedding(cfg.n_coarse, cfg.d_region)
+        self.region_mlp  = nn.Sequential(
+            nn.Linear(cfg.d_region, cfg.d_region, bias=False),
+            nn.GELU(),
+        )
+        self.region_proj = nn.Linear(cfg.d_region, cfg.d_model, bias=False)
+
+        # Branch-attention refiner (replaces BoundaryRefiner MLP)
+        self.branch_refiner = BranchAttentionRefiner(
+            d_model   = cfg.d_model,
+            n_heads   = cfg.branch_attn_heads,
+            n_layers  = cfg.branch_attn_layers,
+            dropout   = cfg.branch_attn_dropout,
+            scale_init= cfg.branch_scale_init,
+        )
+
+        self._last_gate:      Optional[torch.Tensor] = None
+        self._last_alpha_dyn: Optional[torch.Tensor] = None
+
+    def set_region_scales(self, alpha: float, beta: float = 0.0):
+        self.warmup_scale  = min(1.0, alpha / max(self.cfg.alpha_core, 1e-8))
+        self.current_alpha = alpha
+
+    def _boundary_gate(self, p_region: torch.Tensor) -> torch.Tensor:
+        """Sigmoid gate ∈ [0,1] per (B,T). 1 = boundary, 0 = core."""
+        top2   = p_region.topk(2, dim=-1).values
+        margin = top2[..., 0] - top2[..., 1]
+        return torch.sigmoid(
+            (self.cfg.boundary_tau - margin) / self.cfg.boundary_temp
+        )
+
+    def forward(
+        self,
+        idx: torch.Tensor,
+        oracle_region: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, T = idx.shape
+        pos = torch.arange(T, device=idx.device).unsqueeze(0)
+        x = self.drop(self.token_emb(idx) + self.pos_emb(pos))
+        for block in self.blocks:
+            x = block(x)
+        h = self.ln_f(x)                                        # (B, T, d_model)
+
+        region_logits = self.coarse_head(h)                     # (B, T, K)
+
+        if oracle_region is not None:
+            known    = oracle_region >= 0
+            p_region = torch.full(
+                (B, T, self.cfg.n_coarse), 1.0 / self.cfg.n_coarse, device=idx.device,
+            )
+            oh = F.one_hot(oracle_region.clamp(min=0),
+                           num_classes=self.cfg.n_coarse).float()
+            p_region = torch.where(known.unsqueeze(-1), oh, p_region)
+        else:
+            p_region = F.softmax(region_logits / self.cfg.router_temp, dim=-1)
+
+        # ── Gate (detached: gate selection must not leak into router training) ──
+        gate     = self._boundary_gate(p_region.detach())       # (B, T)
+        gate_exp = gate.unsqueeze(-1)                           # (B, T, 1)
+
+        # ── Core path: single soft-mixture region feature ─────────────────────
+        ws = self.warmup_scale
+        r_soft    = p_region @ self.region_emb.weight           # (B, T, d_region)
+        core_feat = self.region_proj(self.region_mlp(r_soft))   # (B, T, d_model)
+        h_core    = h + self.cfg.alpha_core * ws * core_feat
+
+        # ── Branch path: top-K hypotheses + branch attention ──────────────────
+        K_h = min(self.cfg.hyp_k, self.cfg.n_coarse)
+        topk_out       = p_region.topk(K_h, dim=-1)
+        topk_probs_raw = topk_out.values                        # (B, T, K_h)
+        topk_idx       = topk_out.indices                       # (B, T, K_h)
+
+        topk_probs = topk_probs_raw / (topk_probs_raw.sum(-1, keepdim=True) + 1e-8)
+
+        # Build per-hypothesis hidden states
+        hyp_emb  = self.region_emb(topk_idx)                   # (B, T, K_h, d_region)
+        flat_emb = hyp_emb.reshape(B * T * K_h, self.cfg.d_region)
+        flat_feat= self.region_proj(self.region_mlp(flat_emb)) # (B*T*K_h, d_model)
+        hyp_feat = flat_feat.reshape(B, T, K_h, self.cfg.d_model)
+
+        h_exp  = h.unsqueeze(2).expand(-1, -1, K_h, -1)        # (B, T, K_h, d_model)
+        h_hyps = h_exp + self.cfg.alpha_boundary * ws * hyp_feat
+
+        # Branch attention: let hypotheses interact, then merge
+        h_refined = self.branch_refiner(h_hyps)                 # (B, T, K_h, d_model)
+        h_bnd     = (topk_probs.unsqueeze(-1) * h_refined).sum(dim=2)  # (B, T, d_model)
+
+        # ── Final blend ───────────────────────────────────────────────────────
+        h_final = (1.0 - gate_exp) * h_core + gate_exp * h_bnd
+
+        # Cache for eval per-group tracking
+        self._last_gate      = gate.detach().cpu()
+        self._last_alpha_dyn = (
+            self.cfg.alpha_core * (1.0 - gate) + self.cfg.alpha_boundary * gate
+        ).detach().cpu()
+
+        return self.lm_head(h_final), region_logits, p_region, h_final
+
+    def loss(self, idx: torch.Tensor) -> Dict[str, torch.Tensor]:
+        src = idx[:, :-1]
+        tgt = idx[:, 1:]
+
+        lm_logits, region_logits, _, _ = self.forward(src)
+
+        l_lm  = F.cross_entropy(lm_logits.reshape(-1, self.vocab_size), tgt.reshape(-1))
+        total = l_lm
+        losses: Dict[str, torch.Tensor] = {"lm": l_lm}
+
+        if self.coarse_map is not None:
+            coarse_labels = self.coarse_map[tgt]
+            valid = coarse_labels >= 0
+            if valid.any():
+                l_c = F.cross_entropy(
+                    region_logits.reshape(-1, self.cfg.n_coarse)[valid.reshape(-1)],
+                    coarse_labels.reshape(-1)[valid.reshape(-1)],
+                )
+                total = total + self.cfg.lambda_coarse * l_c
+                losses["coarse"] = l_c
+            p_c   = F.softmax(region_logits, dim=-1)
+            l_bal = -(p_c * (p_c + 1e-8).log()).sum(-1).mean().neg()
+            total = total + self.cfg.lambda_balance * l_bal
+            losses["balance_coarse"] = l_bal
+
+        losses["total"] = total
+        return losses
+
+    def param_count(self) -> int:
+        return sum(p.numel() for p in {id(p): p for p in self.parameters()}.values())
+
+    def param_breakdown(self) -> Dict[str, int]:
+        seen: set = set()
+        def _n(m: nn.Module) -> int:
+            c = 0
+            for p in m.parameters():
+                if id(p) not in seen:
+                    seen.add(id(p)); c += p.numel()
+            return c
+        emb     = _n(self.token_emb) + _n(self.pos_emb)
+        trunk   = sum(_n(b) for b in self.blocks) + _n(self.ln_f)
+        router  = (_n(self.coarse_head) + _n(self.region_emb)
+                   + _n(self.region_mlp) + _n(self.region_proj))
+        refiner = _n(self.branch_refiner)
+        _n(self.lm_head)  # weight-tied → 0
+        total   = self.param_count()
+        return {"emb": emb, "trunk": trunk, "router": router, "refiner": refiner,
+                "total": total, "non_emb": total - self.token_emb.weight.numel()}
+
+
 # ── Region map loaders ─────────────────────────────────────────────────────────
 
 def load_coarse_map(path: str, vocab_size: int) -> Tuple[torch.Tensor, int]:
@@ -1649,7 +1920,8 @@ def evaluate(
                 c_ent.append(mean_entropy(fl))
             usage_buf.append(p_region.detach().mean(dim=(0, 1)).cpu())
 
-        elif isinstance(model, (ReprRegionBoundaryLM, ReprRegionMultiHypLM)):
+        elif isinstance(model, (ReprRegionBoundaryLM, ReprRegionMultiHypLM,
+                                ReprRegionBranchAttnLM)):
             with ctx:
                 lm_logits_bnd, region_logits, p_region, _ = model.forward(src)
             if coarse_map is not None:
@@ -1665,7 +1937,7 @@ def evaluate(
                 log_p    = F.log_softmax(lm_logits_bnd.float(), dim=-1)
                 per_nll  = (-log_p.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
                             ).cpu().reshape(-1)                 # (B*T,)
-                bnd_mask  = gate_flat >= 0.5   # gate > 0.5 → boundary
+                bnd_mask  = gate_flat >= 0.5
                 core_mask = ~bnd_mask
                 bnd_frac_buf.append(bnd_mask.float().mean().item())
                 if bnd_mask.any():
@@ -1700,12 +1972,17 @@ def evaluate(
         "current_alpha":        getattr(model, "current_alpha", 0.0),
         "current_beta":         getattr(model, "current_beta",  0.0),
         "current_router_temp":  getattr(model, "current_router_temp", 0.0),
-        # ReprRegionBoundaryLM per-group metrics (0.0 for other models)
+        # ReprRegionBoundaryLM / multihyp / branchattn per-group metrics
         "val_boundary_lm":      avg(bnd_nll_buf),
         "val_core_lm":          avg(core_nll_buf),
         "val_boundary_frac":    avg(bnd_frac_buf),
         "val_avg_boundary_alpha": avg(bnd_alpha_buf),
         "val_avg_core_alpha":     avg(core_alpha_buf),
+        # BranchAttentionRefiner-specific (0.0 for other models)
+        "val_branch_scale": (
+            float(torch.tanh(model.branch_refiner.branch_scale).item())
+            if isinstance(model, ReprRegionBranchAttnLM) else 0.0
+        ),
     }
     # Usage diversity stats for ReprRegionCapacityLM
     if usage_buf:
@@ -1814,6 +2091,9 @@ def train(cfg: TrainConfig):
                       "random_repr_region_multihyp"):
         assert coarse_map is not None, f"{cfg.mode} requires --region_map_path"
         model = ReprRegionMultiHypLM(cfg, vocab_size, coarse_map=coarse_map)
+    elif cfg.mode == "repr_region_branchattn":
+        assert coarse_map is not None, f"{cfg.mode} requires --region_map_path"
+        model = ReprRegionBranchAttnLM(cfg, vocab_size, coarse_map=coarse_map)
     else:
         model = RegionConditionedTransformerLM(
             cfg, vocab_size, coarse_map=coarse_map, leaf_map=leaf_map,
@@ -1892,7 +2172,8 @@ def train(cfg: TrainConfig):
             else:
                 scale = min(1.0, step / cfg.region_warmup_steps)
             model.set_region_scales(cfg.base_alpha * scale, cfg.base_beta * scale)
-        elif isinstance(model, (ReprRegionBoundaryLM, ReprRegionMultiHypLM)):
+        elif isinstance(model, (ReprRegionBoundaryLM, ReprRegionMultiHypLM,
+                                ReprRegionBranchAttnLM)):
             if cfg.region_warmup_steps <= 0:
                 scale = 1.0
             else:
@@ -1955,13 +2236,16 @@ def train(cfg: TrainConfig):
             _csv_writer.writerow(row)
             _csv_file.flush()
             _bnd_extra = ""
-            if isinstance(model, (ReprRegionBoundaryLM, ReprRegionMultiHypLM)) and val["val_boundary_frac"] > 0:
+            if isinstance(model, (ReprRegionBoundaryLM, ReprRegionMultiHypLM,
+                                   ReprRegionBranchAttnLM)) and val["val_boundary_frac"] > 0:
                 _bnd_extra = (
                     f"  bnd_lm={val['val_boundary_lm']:.4f}"
                     f"  core_lm={val['val_core_lm']:.4f}"
                     f"  bnd_frac={val['val_boundary_frac']:.2f}"
                     f"  α_bnd={val['val_avg_boundary_alpha']:.3f}"
                 )
+                if isinstance(model, ReprRegionBranchAttnLM):
+                    _bnd_extra += f"  br_scale={val['val_branch_scale']:.4f}"
             print(
                 f"  [val] val_lm={val['val_lm_loss']:.4f}  ppl={val['val_ppl']:.2f}"
                 f"  coarse_acc@1={val['val_coarse_acc1']:.3f}"
@@ -2900,6 +3184,15 @@ def _parse_args() -> TrainConfig:
     # repr_region_multihyp
     p.add_argument("--hyp_k",          type=int,   default=4,
                    help="Number of top-k latent hypotheses to preserve at boundary tokens")
+    # repr_region_branchattn
+    p.add_argument("--branch_attn_heads",   type=int,   default=4,
+                   help="Attention heads in BranchAttentionRefiner (over K dim)")
+    p.add_argument("--branch_attn_layers",  type=int,   default=1,
+                   help="Number of stacked branch-attention layers")
+    p.add_argument("--branch_attn_dropout", type=float, default=0.1,
+                   help="Dropout inside BranchAttentionRefiner")
+    p.add_argument("--branch_scale_init",   type=float, default=0.0,
+                   help="Initial value of tanh-gated residual scale (0 = identity at init)")
     # repr_region_boundary / repr_region_multihyp
     p.add_argument("--alpha_core",     type=float, default=0.2,
                    help="Alpha for high-margin (core) token conditioning")
@@ -2959,6 +3252,10 @@ def _parse_args() -> TrainConfig:
         router_temp_final=a.router_temp_final,
         router_temp_decay_steps=a.router_temp_decay_steps,
         hyp_k=a.hyp_k,
+        branch_attn_heads=a.branch_attn_heads,
+        branch_attn_layers=a.branch_attn_layers,
+        branch_attn_dropout=a.branch_attn_dropout,
+        branch_scale_init=a.branch_scale_init,
         alpha_core=a.alpha_core,
         alpha_boundary=a.alpha_boundary,
         boundary_tau=a.boundary_tau,
