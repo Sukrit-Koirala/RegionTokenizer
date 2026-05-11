@@ -42,7 +42,7 @@ _MODES = ("baseline", "coarse", "coarse_leaf", "random_control", "oracle_coarse"
           "repr_region_capacity", "oracle_repr_region_capacity", "random_repr_region_capacity",
           "repr_region_boundary", "oracle_repr_region_boundary", "random_repr_region_boundary",
           "repr_region_multihyp", "oracle_repr_region_multihyp", "random_repr_region_multihyp",
-          "repr_region_branchattn",
+          "repr_region_branchattn", "repr_region_branch_identity",
           "boundary_analysis")
 
 
@@ -129,7 +129,7 @@ class TrainConfig:
     branch_attn_heads: int = 4            # attention heads over K branch dimension
     branch_attn_layers: int = 1           # stacked branch-attention layers
     branch_attn_dropout: float = 0.1      # dropout inside BranchAttentionRefiner
-    branch_scale_init: float = 0.0        # initial value of tanh-gated residual scale
+    branch_scale_init: float = 0.05       # initial value of tanh-gated residual scale
     # boundary_analysis mode
     repr_ckpt: Optional[str] = None        # trained repr_region checkpoint to analyse
     max_analysis_batches: int = 200        # val batches to process (0 = all)
@@ -1384,10 +1384,11 @@ class _BranchAttnLayer(nn.Module):
             nn.Linear(4 * d_model, d_model, bias=False),
         )
         self.drop = nn.Dropout(dropout)
-
-        # Zero-init both output projections so the layer starts as identity
-        nn.init.zeros_(self.attn.out_proj.weight)
-        nn.init.zeros_(self.ffn[-1].weight)
+        # NOTE: no zero-init here — _init_weights handles all linears at std=0.02.
+        # Zero-init on both projections AND branch_scale=0 killed all gradients
+        # through the refiner (delta=0 → d_out/d_scale=0 AND d_out/d_params=0).
+        # Identity-at-init is instead ensured by tanh(branch_scale_init≈0.05) ≈ 0.05,
+        # giving a tiny but gradient-carrying contribution from the start.
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (N, K, d_model)  where N = B*T
@@ -1406,8 +1407,8 @@ class BranchAttentionRefiner(nn.Module):
     Output: (B, T, K, d_model)
 
     Flattens B*T into the batch axis, treats K as the sequence axis for
-    self-attention.  A tanh-gated learnable scale (initialized to 0) keeps
-    the module near-identity at training onset.
+    self-attention.  A tanh-gated learnable scale keeps the initial contribution
+    small without killing gradients (unlike zero-init projections + scale=0).
     """
 
     def __init__(self, d_model: int, n_heads: int, n_layers: int,
@@ -1419,30 +1420,31 @@ class BranchAttentionRefiner(nn.Module):
         ])
         self.branch_scale = nn.Parameter(torch.tensor(float(scale_init)))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # x: (B, T, K, d_model)
         B, T, K, D = x.shape
-        flat = x.reshape(B * T, K, D)           # (B*T, K, d_model)
-        delta = flat
+        flat = x.reshape(B * T, K, D)    # (B*T, K, d_model)
+        refined = flat
         for layer in self.layers:
-            delta = layer(delta)
-        delta = delta - flat                      # residual delta only
+            refined = layer(refined)
+        delta = refined - flat            # (B*T, K, d_model)
         scale = torch.tanh(self.branch_scale)
-        out = flat + scale * delta
-        return out.reshape(B, T, K, D)
+        out   = flat + scale * delta
+        return out.reshape(B, T, K, D), delta.reshape(B, T, K, D)
 
 
 class ReprRegionBranchAttnLM(nn.Module):
     """
     repr_region with boundary-gated multi-hypothesis branch attention.
 
-    Identical gating to repr_region_multihyp (detached p_region for gate),
-    but replaces the shared MLP BoundaryRefiner with BranchAttentionRefiner:
-    a lightweight Transformer over the K hypothesis dimension that lets
-    branches interact before probability-weighted merging.
+    Modes handled:
+      repr_region_branchattn   — full branch-attention refiner
+      repr_region_branch_identity — skip refiner (diagnostic: is the branch path
+                                    itself useful before any refinement?)
 
-    Hypothesis: boundary uncertainty benefits from cross-branch interaction,
-    not just independent per-branch refinement.
+    Identical gating to repr_region_multihyp (detached p_region for gate),
+    but replaces the shared MLP BoundaryRefiner with BranchAttentionRefiner
+    that runs attention over the K hypothesis dimension before merging.
     """
 
     def __init__(
@@ -1454,6 +1456,7 @@ class ReprRegionBranchAttnLM(nn.Module):
         super().__init__()
         self.cfg        = cfg
         self.vocab_size = vocab_size
+        self.use_branch_attn = (cfg.mode != "repr_region_branch_identity")
 
         self.register_buffer("coarse_map", coarse_map)
         self.current_alpha: float = cfg.alpha_core
@@ -1462,51 +1465,39 @@ class ReprRegionBranchAttnLM(nn.Module):
         self.token_emb = nn.Embedding(vocab_size, cfg.d_model)
         self.pos_emb   = nn.Embedding(cfg.seq_len, cfg.d_model)
         self.drop      = nn.Dropout(cfg.dropout)
-        self.blocks    = nn.ModuleList([
-            TransformerBlock(cfg.d_model, cfg.n_head, cfg.d_ff,
-                             cfg.seq_len, cfg.dropout)
-            for _ in range(cfg.n_layer)
-        ])
+        self.blocks    = _make_blocks(cfg, cfg.n_layer)
         self.ln_f      = nn.LayerNorm(cfg.d_model)
-        self.lm_head   = nn.Linear(cfg.d_model, vocab_size, bias=False)
-        self.lm_head.weight = self.token_emb.weight   # weight tying
 
-        # Router
-        if cfg.router_type == "mlp":
-            self.coarse_head = nn.Sequential(
-                nn.Linear(cfg.d_model, cfg.d_model, bias=False),
-                nn.GELU(),
-                nn.Linear(cfg.d_model, cfg.n_coarse, bias=False),
-            )
-        else:
-            self.coarse_head = nn.Linear(cfg.d_model, cfg.n_coarse, bias=False)
+        self.lm_head = nn.Linear(cfg.d_model, vocab_size, bias=False)
+        self.token_emb.weight = self.lm_head.weight   # weight tying (match multihyp)
 
-        # Region feature pipeline (shared by core and branch paths)
-        self.region_emb  = nn.Embedding(cfg.n_coarse, cfg.d_region)
-        self.region_mlp  = nn.Sequential(
-            nn.Linear(cfg.d_region, cfg.d_region, bias=False),
-            nn.GELU(),
-        )
-        self.region_proj = nn.Linear(cfg.d_region, cfg.d_model, bias=False)
+        self.coarse_head  = _make_router_head(cfg.d_model, cfg.n_coarse,
+                                              cfg.dropout, cfg.router_type)
+        self.region_emb   = nn.Embedding(cfg.n_coarse, cfg.d_region)
+        self.region_mlp   = FFN(cfg.d_region, cfg.d_region * 2, dropout=0.0)
+        self.region_proj  = nn.Linear(cfg.d_region, cfg.d_model, bias=False)
 
-        # Branch-attention refiner (replaces BoundaryRefiner MLP)
         self.branch_refiner = BranchAttentionRefiner(
-            d_model   = cfg.d_model,
-            n_heads   = cfg.branch_attn_heads,
-            n_layers  = cfg.branch_attn_layers,
-            dropout   = cfg.branch_attn_dropout,
-            scale_init= cfg.branch_scale_init,
+            d_model    = cfg.d_model,
+            n_heads    = cfg.branch_attn_heads,
+            n_layers   = cfg.branch_attn_layers,
+            dropout    = cfg.branch_attn_dropout,
+            scale_init = cfg.branch_scale_init,
         )
+
+        # Apply standard weight init to everything; branch_scale retains its
+        # custom init value (it is an nn.Parameter, not nn.Linear/nn.Embedding).
+        self.apply(_init_weights)
 
         self._last_gate:      Optional[torch.Tensor] = None
         self._last_alpha_dyn: Optional[torch.Tensor] = None
+        self._last_norms:     Dict[str, float]       = {}
 
     def set_region_scales(self, alpha: float, beta: float = 0.0):
         self.warmup_scale  = min(1.0, alpha / max(self.cfg.alpha_core, 1e-8))
         self.current_alpha = alpha
 
     def _boundary_gate(self, p_region: torch.Tensor) -> torch.Tensor:
-        """Sigmoid gate ∈ [0,1] per (B,T). 1 = boundary, 0 = core."""
         top2   = p_region.topk(2, dim=-1).values
         margin = top2[..., 0] - top2[..., 1]
         return torch.sigmoid(
@@ -1525,7 +1516,7 @@ class ReprRegionBranchAttnLM(nn.Module):
             x = block(x)
         h = self.ln_f(x)                                        # (B, T, d_model)
 
-        region_logits = self.coarse_head(h)                     # (B, T, K)
+        region_logits = self.coarse_head(h)
 
         if oracle_region is not None:
             known    = oracle_region >= 0
@@ -1538,45 +1529,51 @@ class ReprRegionBranchAttnLM(nn.Module):
         else:
             p_region = F.softmax(region_logits / self.cfg.router_temp, dim=-1)
 
-        # ── Gate (detached: gate selection must not leak into router training) ──
-        gate     = self._boundary_gate(p_region.detach())       # (B, T)
-        gate_exp = gate.unsqueeze(-1)                           # (B, T, 1)
+        gate     = self._boundary_gate(p_region.detach())
+        gate_exp = gate.unsqueeze(-1)
 
-        # ── Core path: single soft-mixture region feature ─────────────────────
         ws = self.warmup_scale
-        r_soft    = p_region @ self.region_emb.weight           # (B, T, d_region)
-        core_feat = self.region_proj(self.region_mlp(r_soft))   # (B, T, d_model)
+        r_soft    = p_region @ self.region_emb.weight
+        core_feat = self.region_proj(self.region_mlp(r_soft))
         h_core    = h + self.cfg.alpha_core * ws * core_feat
 
-        # ── Branch path: top-K hypotheses + branch attention ──────────────────
         K_h = min(self.cfg.hyp_k, self.cfg.n_coarse)
         topk_out       = p_region.topk(K_h, dim=-1)
         topk_probs_raw = topk_out.values                        # (B, T, K_h)
-        topk_idx       = topk_out.indices                       # (B, T, K_h)
+        topk_idx       = topk_out.indices
 
         topk_probs = topk_probs_raw / (topk_probs_raw.sum(-1, keepdim=True) + 1e-8)
 
-        # Build per-hypothesis hidden states
         hyp_emb  = self.region_emb(topk_idx)                   # (B, T, K_h, d_region)
         flat_emb = hyp_emb.reshape(B * T * K_h, self.cfg.d_region)
-        flat_feat= self.region_proj(self.region_mlp(flat_emb)) # (B*T*K_h, d_model)
+        flat_feat= self.region_proj(self.region_mlp(flat_emb))
         hyp_feat = flat_feat.reshape(B, T, K_h, self.cfg.d_model)
 
-        h_exp  = h.unsqueeze(2).expand(-1, -1, K_h, -1)        # (B, T, K_h, d_model)
-        h_hyps = h_exp + self.cfg.alpha_boundary * ws * hyp_feat
+        h_exp  = h.unsqueeze(2).expand(-1, -1, K_h, -1)
+        h_hyps = h_exp + self.cfg.alpha_boundary * ws * hyp_feat   # (B, T, K_h, d_model)
 
-        # Branch attention: let hypotheses interact, then merge
-        h_refined = self.branch_refiner(h_hyps)                 # (B, T, K_h, d_model)
-        h_bnd     = (topk_probs.unsqueeze(-1) * h_refined).sum(dim=2)  # (B, T, d_model)
+        if self.use_branch_attn:
+            h_refined, refined_delta = self.branch_refiner(h_hyps)
+        else:
+            h_refined    = h_hyps
+            refined_delta = torch.zeros_like(h_hyps)
 
-        # ── Final blend ───────────────────────────────────────────────────────
+        h_bnd   = (topk_probs.unsqueeze(-1) * h_refined).sum(dim=2)  # (B, T, d_model)
         h_final = (1.0 - gate_exp) * h_core + gate_exp * h_bnd
 
-        # Cache for eval per-group tracking
         self._last_gate      = gate.detach().cpu()
         self._last_alpha_dyn = (
             self.cfg.alpha_core * (1.0 - gate) + self.cfg.alpha_boundary * gate
         ).detach().cpu()
+        with torch.no_grad():
+            self._last_norms = {
+                "h_norm":             h.norm(dim=-1).mean().item(),
+                "h_core_delta_norm":  (h_core - h).norm(dim=-1).mean().item(),
+                "h_bnd_delta_norm":   (h_bnd  - h).norm(dim=-1).mean().item(),
+                "h_final_delta_norm": (h_final - h).norm(dim=-1).mean().item(),
+                "hyp_feat_norm":      hyp_feat.norm(dim=-1).mean().item(),
+                "refined_delta_norm": refined_delta.norm(dim=-1).mean().item(),
+            }
 
         return self.lm_head(h_final), region_logits, p_region, h_final
 
@@ -1983,6 +1980,8 @@ def evaluate(
             float(torch.tanh(model.branch_refiner.branch_scale).item())
             if isinstance(model, ReprRegionBranchAttnLM) else 0.0
         ),
+        **({f"val_{k}": v for k, v in model._last_norms.items()}
+           if isinstance(model, ReprRegionBranchAttnLM) and model._last_norms else {}),
     }
     # Usage diversity stats for ReprRegionCapacityLM
     if usage_buf:
@@ -2091,7 +2090,7 @@ def train(cfg: TrainConfig):
                       "random_repr_region_multihyp"):
         assert coarse_map is not None, f"{cfg.mode} requires --region_map_path"
         model = ReprRegionMultiHypLM(cfg, vocab_size, coarse_map=coarse_map)
-    elif cfg.mode == "repr_region_branchattn":
+    elif cfg.mode in ("repr_region_branchattn", "repr_region_branch_identity"):
         assert coarse_map is not None, f"{cfg.mode} requires --region_map_path"
         model = ReprRegionBranchAttnLM(cfg, vocab_size, coarse_map=coarse_map)
     else:
@@ -2173,7 +2172,7 @@ def train(cfg: TrainConfig):
                 scale = min(1.0, step / cfg.region_warmup_steps)
             model.set_region_scales(cfg.base_alpha * scale, cfg.base_beta * scale)
         elif isinstance(model, (ReprRegionBoundaryLM, ReprRegionMultiHypLM,
-                                ReprRegionBranchAttnLM)):
+                                 ReprRegionBranchAttnLM)):
             if cfg.region_warmup_steps <= 0:
                 scale = 1.0
             else:
@@ -2215,6 +2214,19 @@ def train(cfg: TrainConfig):
                 f"step {step:6d}  lm={ema_lm:.4f}  total={ema_total:.4f}"
                 f"  lr={lr:.2e}  α={alpha:.3f}  β={beta:.4f}  T={rtemp:.2f}  tok/s={tps:.0f}"
             )
+            # ── Gradient norm diagnostics for branchattn modes ────────────────
+            if isinstance(model, ReprRegionBranchAttnLM):
+                def _gnorm(params) -> float:
+                    g = [p.grad for p in params if p.grad is not None]
+                    return float(torch.stack([p.norm() for p in g]).norm().item()) if g else 0.0
+                print(
+                    f"  [grad] branch_scale.grad={float(model.branch_refiner.branch_scale.grad.item()) if model.branch_refiner.branch_scale.grad is not None else 0.0:.2e}"
+                    f"  branch_attn={_gnorm(model.branch_refiner.parameters()):.2e}"
+                    f"  region_proj={_gnorm(model.region_proj.parameters()):.2e}"
+                    f"  router={_gnorm(model.coarse_head.parameters()):.2e}"
+                    f"  trunk={_gnorm(p for b in model.blocks for p in b.parameters()):.2e}"
+                    f"  br_scale(tanh)={float(torch.tanh(model.branch_refiner.branch_scale).item()):.4f}"
+                )
 
         if step % cfg.eval_interval == 0 or step == cfg.steps:
             val = evaluate(model, val_loader, cfg, device,
@@ -2253,6 +2265,16 @@ def train(cfg: TrainConfig):
                 f"  α={val['current_alpha']:.3f}"
                 + _bnd_extra
             )
+            if isinstance(model, ReprRegionBranchAttnLM) and model._last_norms:
+                n = model._last_norms
+                print(
+                    f"  [norms] ||h||={n['h_norm']:.3f}"
+                    f"  ||Δh_core||={n['h_core_delta_norm']:.3f}"
+                    f"  ||Δh_bnd||={n['h_bnd_delta_norm']:.3f}"
+                    f"  ||Δh_final||={n['h_final_delta_norm']:.3f}"
+                    f"  ||hyp_feat||={n['hyp_feat_norm']:.3f}"
+                    f"  ||ref_delta||={n['refined_delta_norm']:.3f}"
+                )
             model.train()
 
         if step % cfg.save_interval == 0 or step == cfg.steps:
