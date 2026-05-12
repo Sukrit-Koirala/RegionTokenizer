@@ -32,7 +32,8 @@ make_random_partition_map = m.make_random_partition_map
 ReprRegionBoundaryLM     = m.ReprRegionBoundaryLM
 ReprRegionMultiHypLM     = m.ReprRegionMultiHypLM
 ReprRegionBranchAttnLM   = m.ReprRegionBranchAttnLM
-ReprRegionBoundarySeqRefineLM = m.ReprRegionBoundarySeqRefineLM
+ReprRegionBoundarySeqRefineLM    = m.ReprRegionBoundarySeqRefineLM
+ReprRegionBoundaryAdaptiveDepthLM = m.ReprRegionBoundaryAdaptiveDepthLM
 
 BOUNDARY_MODES = {
     "repr_region_boundary":          ReprRegionBoundaryLM,
@@ -41,6 +42,8 @@ BOUNDARY_MODES = {
     "repr_region_branch_identity":   ReprRegionBranchAttnLM,
     "repr_region_boundary_seqrefine":ReprRegionBoundarySeqRefineLM,
     "random_repr_region_boundary_seqrefine": ReprRegionBoundarySeqRefineLM,
+    "repr_region_boundary_adaptivedepth":    ReprRegionBoundaryAdaptiveDepthLM,
+    "random_repr_region_boundary_adaptivedepth": ReprRegionBoundaryAdaptiveDepthLM,
 }
 
 VOCAB_SIZE   = 50257
