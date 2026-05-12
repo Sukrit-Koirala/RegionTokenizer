@@ -43,6 +43,7 @@ _MODES = ("baseline", "coarse", "coarse_leaf", "random_control", "oracle_coarse"
           "repr_region_boundary", "oracle_repr_region_boundary", "random_repr_region_boundary",
           "repr_region_multihyp", "oracle_repr_region_multihyp", "random_repr_region_multihyp",
           "repr_region_branchattn", "repr_region_branch_identity",
+          "repr_region_boundary_seqrefine", "random_repr_region_boundary_seqrefine",
           "boundary_analysis")
 
 
@@ -125,6 +126,9 @@ class TrainConfig:
     boundary_mode: str = "margin"         # "margin" | "entropy"
     # repr_region_multihyp mode
     hyp_k: int = 4                        # number of top-k hypotheses to preserve
+    # repr_region_boundary_seqrefine mode
+    boundary_refine_layers: int = 1       # causal Transformer blocks for seqrefine
+    boundary_refine_gamma: float = 0.5    # fixed scale multiplier for refine contribution
     # repr_region_branchattn mode
     branch_attn_heads: int = 4            # attention heads over K branch dimension
     branch_attn_layers: int = 1           # stacked branch-attention layers
@@ -1140,7 +1144,199 @@ class ReprRegionBoundaryLM(nn.Module):
                 "total": total, "non_emb": total - self.token_emb.weight.numel()}
 
 
-# ── Boundary refiner ───────────────────────────────────────────────────────────
+# ── Boundary Sequence Refiner ─────────────────────────────────────────────────
+
+class ReprRegionBoundarySeqRefineLM(nn.Module):
+    """
+    repr_region_boundary + gate-weighted causal sequence refinement.
+
+    Hypothesis: boundary tokens need extra *contextual* computation (seeing
+    neighboring tokens through sequence attention) rather than static top-k
+    region-branch manipulation.
+
+    Core path (all tokens, fixed alpha_core):
+        h_core  = h + alpha_core * warmup_scale * region_feat
+
+    Boundary refinement (causal, gated):
+        h_seq   = seq_blocks(h_core)       # 1+ causal TransformerBlocks
+        scale   = tanh(refine_scale) * boundary_refine_gamma * warmup_scale
+        h_final = h_core + gate.unsqueeze(-1) * scale * (h_seq - h_core)
+
+    Gate: same calibrated margin gate as repr_region_boundary.
+    Causal mask is enforced by TransformerBlock's CausalSelfAttention.
+    refine_scale initialized to 0.05 → small live gradient at step 0.
+    """
+
+    def __init__(
+        self,
+        cfg: TrainConfig,
+        vocab_size: int,
+        coarse_map: torch.Tensor,
+    ):
+        super().__init__()
+        self.cfg        = cfg
+        self.vocab_size = vocab_size
+
+        self.register_buffer("coarse_map", coarse_map)
+        self.current_alpha: float = cfg.alpha_core
+        self.warmup_scale:  float = 1.0
+
+        self.token_emb = nn.Embedding(vocab_size, cfg.d_model)
+        self.pos_emb   = nn.Embedding(cfg.seq_len, cfg.d_model)
+        self.drop      = nn.Dropout(cfg.dropout)
+        self.blocks    = _make_blocks(cfg, cfg.n_layer)
+        self.ln_f      = nn.LayerNorm(cfg.d_model)
+
+        self.coarse_head = _make_router_head(cfg.d_model, cfg.n_coarse,
+                                             cfg.dropout, cfg.router_type)
+        self.region_emb  = nn.Embedding(cfg.n_coarse, cfg.d_region)
+        self.region_mlp  = FFN(cfg.d_region, cfg.d_region * 2, dropout=0.0)
+        self.region_proj = nn.Linear(cfg.d_region, cfg.d_model, bias=False)
+
+        # Extra causal blocks for boundary refinement.
+        # Uses the same d_model / n_head / d_ff as the main trunk.
+        self.seq_refine_blocks = nn.ModuleList([
+            TransformerBlock(cfg.d_model, cfg.n_head, cfg.d_ff,
+                             cfg.seq_len, cfg.dropout)
+            for _ in range(cfg.boundary_refine_layers)
+        ])
+        # refine_scale ≠ 0 so gradients are live from step 0.
+        # tanh(0.05) * gamma ≈ 0.025 initial effective scale.
+        self.refine_scale = nn.Parameter(torch.tensor(0.05))
+
+        self.lm_head = nn.Linear(cfg.d_model, vocab_size, bias=False)
+        self.token_emb.weight = self.lm_head.weight
+        self.apply(_init_weights)
+
+        self._last_gate:      Optional[torch.Tensor] = None
+        self._last_alpha_dyn: Optional[torch.Tensor] = None
+        self._last_norms:     Dict[str, float]       = {}
+
+    def set_region_scales(self, alpha: float, beta: float = 0.0):
+        self.warmup_scale  = min(1.0, alpha / max(self.cfg.alpha_core, 1e-8))
+        self.current_alpha = alpha
+
+    def _boundary_gate(self, p_region: torch.Tensor) -> torch.Tensor:
+        if self.cfg.boundary_mode == "entropy":
+            H = -(p_region * (p_region + 1e-8).log()).sum(-1)
+            return H / math.log(max(self.cfg.n_coarse, 2))
+        top2   = p_region.topk(2, dim=-1).values
+        margin = top2[..., 0] - top2[..., 1]
+        return torch.sigmoid(
+            (self.cfg.boundary_tau - margin) / self.cfg.boundary_temp
+        )
+
+    def forward(
+        self,
+        idx: torch.Tensor,
+        oracle_region: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, T = idx.shape
+        pos = torch.arange(T, device=idx.device).unsqueeze(0)
+        x = self.drop(self.token_emb(idx) + self.pos_emb(pos))
+        for block in self.blocks:
+            x = block(x)
+        h = self.ln_f(x)
+
+        region_logits = self.coarse_head(h)
+
+        if oracle_region is not None:
+            known    = oracle_region >= 0
+            p_region = torch.full(
+                (B, T, self.cfg.n_coarse), 1.0 / self.cfg.n_coarse, device=idx.device,
+            )
+            oh = F.one_hot(oracle_region.clamp(min=0),
+                           num_classes=self.cfg.n_coarse).float()
+            p_region = torch.where(known.unsqueeze(-1), oh, p_region)
+        else:
+            p_region = F.softmax(region_logits / self.cfg.router_temp, dim=-1)
+
+        # Gate always uses full p_region (not top-k renormalized)
+        gate = self._boundary_gate(p_region.detach())           # (B, T)
+
+        ws = self.warmup_scale
+        r           = p_region @ self.region_emb.weight
+        region_feat = self.region_proj(self.region_mlp(r))
+        h_core      = h + self.cfg.alpha_core * ws * region_feat
+
+        # Causal sequence refinement — one pass per block
+        h_seq = h_core
+        for blk in self.seq_refine_blocks:
+            h_seq = blk(h_seq)
+
+        # Gate-weighted blend; warmup also scales the refine contribution
+        scale   = torch.tanh(self.refine_scale) * self.cfg.boundary_refine_gamma * ws
+        h_final = h_core + gate.unsqueeze(-1) * scale * (h_seq - h_core)
+
+        self._last_gate      = gate.detach().cpu()
+        # alpha_dyn for logging compat: alpha_core + gate * extra_refinement_effect
+        self._last_alpha_dyn = (self.cfg.alpha_core * torch.ones_like(gate)).detach().cpu()
+        with torch.no_grad():
+            self._last_norms = {
+                "h_norm":              h.norm(dim=-1).mean().item(),
+                "h_seq_delta_norm":    (h_seq   - h_core).norm(dim=-1).mean().item(),
+                "h_final_delta_norm":  (h_final - h_core).norm(dim=-1).mean().item(),
+            }
+
+        return self.lm_head(h_final), region_logits, p_region, h_final
+
+    def loss(self, idx: torch.Tensor) -> Dict[str, torch.Tensor]:
+        src = idx[:, :-1]
+        tgt = idx[:, 1:]
+
+        oracle_region = None
+        if (self.cfg.mode == "oracle_repr_region_boundary_seqrefine"
+                and self.coarse_map is not None):
+            oracle_region = self.coarse_map[tgt]
+
+        lm_logits, region_logits, _, _ = self.forward(src, oracle_region)
+
+        l_lm  = F.cross_entropy(lm_logits.reshape(-1, self.vocab_size), tgt.reshape(-1))
+        total = l_lm
+        losses: Dict[str, torch.Tensor] = {"lm": l_lm}
+
+        if (self.cfg.mode not in ("oracle_repr_region_boundary_seqrefine",)
+                and self.coarse_map is not None):
+            coarse_labels = self.coarse_map[tgt]
+            valid = coarse_labels >= 0
+            if valid.any():
+                l_c = F.cross_entropy(
+                    region_logits.reshape(-1, self.cfg.n_coarse)[valid.reshape(-1)],
+                    coarse_labels.reshape(-1)[valid.reshape(-1)],
+                )
+                total = total + self.cfg.lambda_coarse * l_c
+                losses["coarse"] = l_c
+            p_c   = F.softmax(region_logits, dim=-1)
+            l_bal = -(p_c * (p_c + 1e-8).log()).sum(-1).mean().neg()
+            total = total + self.cfg.lambda_balance * l_bal
+            losses["balance_coarse"] = l_bal
+
+        losses["total"] = total
+        return losses
+
+    def param_count(self) -> int:
+        return sum(p.numel() for p in {id(p): p for p in self.parameters()}.values())
+
+    def param_breakdown(self) -> Dict[str, int]:
+        seen: set = set()
+        def _n(m: nn.Module) -> int:
+            c = 0
+            for p in m.parameters():
+                if id(p) not in seen:
+                    seen.add(id(p)); c += p.numel()
+            return c
+        emb     = _n(self.token_emb) + _n(self.pos_emb)
+        trunk   = sum(_n(b) for b in self.blocks) + _n(self.ln_f)
+        router  = (_n(self.coarse_head) + _n(self.region_emb)
+                   + _n(self.region_mlp) + _n(self.region_proj))
+        refiner = sum(_n(b) for b in self.seq_refine_blocks)
+        _n(self.lm_head)
+        total   = self.param_count()
+        return {"emb": emb, "trunk": trunk, "router": router, "refiner": refiner,
+                "total": total, "non_emb": total - self.token_emb.weight.numel()}
+
+
+# ── Boundary refiner (MLP, used by MultiHyp) ──────────────────────────────────
 
 class BoundaryRefiner(nn.Module):
     """Small shared MLP applied independently to each latent hypothesis.
@@ -1918,7 +2114,8 @@ def evaluate(
             usage_buf.append(p_region.detach().mean(dim=(0, 1)).cpu())
 
         elif isinstance(model, (ReprRegionBoundaryLM, ReprRegionMultiHypLM,
-                                ReprRegionBranchAttnLM)):
+                                ReprRegionBranchAttnLM,
+                                ReprRegionBoundarySeqRefineLM)):
             with ctx:
                 lm_logits_bnd, region_logits, p_region, _ = model.forward(src)
             if coarse_map is not None:
@@ -1975,13 +2172,17 @@ def evaluate(
         "val_boundary_frac":    avg(bnd_frac_buf),
         "val_avg_boundary_alpha": avg(bnd_alpha_buf),
         "val_avg_core_alpha":     avg(core_alpha_buf),
-        # BranchAttentionRefiner-specific (0.0 for other models)
+        # Refiner-specific scales (0.0 for non-applicable models)
         "val_branch_scale": (
             float(torch.tanh(model.branch_refiner.branch_scale).item())
             if isinstance(model, ReprRegionBranchAttnLM) else 0.0
         ),
+        "val_refine_scale": (
+            float(torch.tanh(model.refine_scale).item())
+            if isinstance(model, ReprRegionBoundarySeqRefineLM) else 0.0
+        ),
         **({f"val_{k}": v for k, v in model._last_norms.items()}
-           if isinstance(model, ReprRegionBranchAttnLM) and model._last_norms else {}),
+           if hasattr(model, "_last_norms") and model._last_norms else {}),
     }
     # Usage diversity stats for ReprRegionCapacityLM
     if usage_buf:
@@ -2037,7 +2238,8 @@ def train(cfg: TrainConfig):
         cfg.n_coarse = n_coarse_actual
         _RANDOM_MODES = ("random_control", "random_soft_moe",
                          "random_repr_region", "random_repr_region_capacity",
-                         "random_repr_region_boundary", "random_repr_region_multihyp")
+                         "random_repr_region_boundary", "random_repr_region_multihyp",
+                         "random_repr_region_boundary_seqrefine")
         if cfg.mode in _RANDOM_MODES:
             raw_coarse = make_random_partition_map(raw_coarse, cfg.n_coarse, seed=cfg.seed)
         coarse_map = raw_coarse.to(device)
@@ -2090,6 +2292,10 @@ def train(cfg: TrainConfig):
                       "random_repr_region_multihyp"):
         assert coarse_map is not None, f"{cfg.mode} requires --region_map_path"
         model = ReprRegionMultiHypLM(cfg, vocab_size, coarse_map=coarse_map)
+    elif cfg.mode in ("repr_region_boundary_seqrefine",
+                      "random_repr_region_boundary_seqrefine"):
+        assert coarse_map is not None, f"{cfg.mode} requires --region_map_path"
+        model = ReprRegionBoundarySeqRefineLM(cfg, vocab_size, coarse_map=coarse_map)
     elif cfg.mode in ("repr_region_branchattn", "repr_region_branch_identity"):
         assert coarse_map is not None, f"{cfg.mode} requires --region_map_path"
         model = ReprRegionBranchAttnLM(cfg, vocab_size, coarse_map=coarse_map)
@@ -2172,7 +2378,8 @@ def train(cfg: TrainConfig):
                 scale = min(1.0, step / cfg.region_warmup_steps)
             model.set_region_scales(cfg.base_alpha * scale, cfg.base_beta * scale)
         elif isinstance(model, (ReprRegionBoundaryLM, ReprRegionMultiHypLM,
-                                 ReprRegionBranchAttnLM)):
+                                 ReprRegionBranchAttnLM,
+                                 ReprRegionBoundarySeqRefineLM)):
             if cfg.region_warmup_steps <= 0:
                 scale = 1.0
             else:
@@ -2214,18 +2421,28 @@ def train(cfg: TrainConfig):
                 f"step {step:6d}  lm={ema_lm:.4f}  total={ema_total:.4f}"
                 f"  lr={lr:.2e}  α={alpha:.3f}  β={beta:.4f}  T={rtemp:.2f}  tok/s={tps:.0f}"
             )
-            # ── Gradient norm diagnostics for branchattn modes ────────────────
-            if isinstance(model, ReprRegionBranchAttnLM):
+            # ── Gradient norm diagnostics for boundary refiner modes ─────────
+            if isinstance(model, (ReprRegionBranchAttnLM, ReprRegionBoundarySeqRefineLM)):
                 def _gnorm(params) -> float:
                     g = [p.grad for p in params if p.grad is not None]
                     return float(torch.stack([p.norm() for p in g]).norm().item()) if g else 0.0
+                if isinstance(model, ReprRegionBranchAttnLM):
+                    scale_p = model.branch_refiner.branch_scale
+                    refiner_params = model.branch_refiner.parameters()
+                    scale_label = "br_scale"
+                else:
+                    scale_p = model.refine_scale
+                    refiner_params = list(model.seq_refine_blocks.parameters()) + [model.refine_scale]
+                    scale_label = "rf_scale"
+                scale_grad = float(scale_p.grad.item()) if scale_p.grad is not None else 0.0
+                scale_tanh = float(torch.tanh(scale_p).item())
                 print(
-                    f"  [grad] branch_scale.grad={float(model.branch_refiner.branch_scale.grad.item()) if model.branch_refiner.branch_scale.grad is not None else 0.0:.2e}"
-                    f"  branch_attn={_gnorm(model.branch_refiner.parameters()):.2e}"
+                    f"  [grad] {scale_label}.grad={scale_grad:.2e}"
+                    f"  refiner={_gnorm(refiner_params):.2e}"
                     f"  region_proj={_gnorm(model.region_proj.parameters()):.2e}"
                     f"  router={_gnorm(model.coarse_head.parameters()):.2e}"
                     f"  trunk={_gnorm(p for b in model.blocks for p in b.parameters()):.2e}"
-                    f"  br_scale(tanh)={float(torch.tanh(model.branch_refiner.branch_scale).item()):.4f}"
+                    f"  {scale_label}(tanh)={scale_tanh:.4f}"
                 )
 
         if step % cfg.eval_interval == 0 or step == cfg.steps:
@@ -2249,15 +2466,19 @@ def train(cfg: TrainConfig):
             _csv_file.flush()
             _bnd_extra = ""
             if isinstance(model, (ReprRegionBoundaryLM, ReprRegionMultiHypLM,
-                                   ReprRegionBranchAttnLM)) and val["val_boundary_frac"] > 0:
+                                   ReprRegionBranchAttnLM,
+                                   ReprRegionBoundarySeqRefineLM)) and val["val_boundary_frac"] > 0:
                 _bnd_extra = (
                     f"  bnd_lm={val['val_boundary_lm']:.4f}"
                     f"  core_lm={val['val_core_lm']:.4f}"
                     f"  bnd_frac={val['val_boundary_frac']:.2f}"
-                    f"  α_bnd={val['val_avg_boundary_alpha']:.3f}"
                 )
                 if isinstance(model, ReprRegionBranchAttnLM):
                     _bnd_extra += f"  br_scale={val['val_branch_scale']:.4f}"
+                elif isinstance(model, ReprRegionBoundarySeqRefineLM):
+                    _bnd_extra += f"  rf_scale={val['val_refine_scale']:.4f}"
+                else:
+                    _bnd_extra += f"  α_bnd={val['val_avg_boundary_alpha']:.3f}"
             print(
                 f"  [val] val_lm={val['val_lm_loss']:.4f}  ppl={val['val_ppl']:.2f}"
                 f"  coarse_acc@1={val['val_coarse_acc1']:.3f}"
@@ -2265,16 +2486,13 @@ def train(cfg: TrainConfig):
                 f"  α={val['current_alpha']:.3f}"
                 + _bnd_extra
             )
-            if isinstance(model, ReprRegionBranchAttnLM) and model._last_norms:
+            if hasattr(model, "_last_norms") and model._last_norms:
                 n = model._last_norms
-                print(
-                    f"  [norms] ||h||={n['h_norm']:.3f}"
-                    f"  ||Δh_core||={n['h_core_delta_norm']:.3f}"
-                    f"  ||Δh_bnd||={n['h_bnd_delta_norm']:.3f}"
-                    f"  ||Δh_final||={n['h_final_delta_norm']:.3f}"
-                    f"  ||hyp_feat||={n['hyp_feat_norm']:.3f}"
-                    f"  ||ref_delta||={n['refined_delta_norm']:.3f}"
-                )
+                norm_parts = [f"  [norms] ||h||={n.get('h_norm', 0):.3f}"]
+                for k, v in n.items():
+                    if k != "h_norm":
+                        norm_parts.append(f"  ||{k}||={v:.3f}")
+                print("".join(norm_parts))
             model.train()
 
         if step % cfg.save_interval == 0 or step == cfg.steps:
@@ -3207,6 +3425,12 @@ def _parse_args() -> TrainConfig:
     p.add_argument("--hyp_k",          type=int,   default=4,
                    help="Number of top-k latent hypotheses to preserve at boundary tokens")
     # repr_region_branchattn
+    # repr_region_boundary_seqrefine
+    p.add_argument("--boundary_refine_layers", type=int,   default=1,
+                   help="Causal Transformer blocks for seqrefine boundary path")
+    p.add_argument("--boundary_refine_gamma",  type=float, default=0.5,
+                   help="Fixed scale multiplier for seqrefine contribution")
+    # repr_region_branchattn
     p.add_argument("--branch_attn_heads",   type=int,   default=4,
                    help="Attention heads in BranchAttentionRefiner (over K dim)")
     p.add_argument("--branch_attn_layers",  type=int,   default=1,
@@ -3274,6 +3498,8 @@ def _parse_args() -> TrainConfig:
         router_temp_final=a.router_temp_final,
         router_temp_decay_steps=a.router_temp_decay_steps,
         hyp_k=a.hyp_k,
+        boundary_refine_layers=a.boundary_refine_layers,
+        boundary_refine_gamma=a.boundary_refine_gamma,
         branch_attn_heads=a.branch_attn_heads,
         branch_attn_layers=a.branch_attn_layers,
         branch_attn_dropout=a.branch_attn_dropout,
