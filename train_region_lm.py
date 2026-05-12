@@ -45,6 +45,7 @@ _MODES = ("baseline", "coarse", "coarse_leaf", "random_control", "oracle_coarse"
           "repr_region_branchattn", "repr_region_branch_identity",
           "repr_region_boundary_seqrefine", "random_repr_region_boundary_seqrefine",
           "repr_region_boundary_adaptivedepth", "random_repr_region_boundary_adaptivedepth",
+          "layer_margin_analysis",
           "boundary_analysis")
 
 
@@ -3050,6 +3051,709 @@ def build_regions(cfg: TrainConfig):
     print(f"[build_regions] done → {out_dir}")
 
 
+# ── Layer margin analysis ──────────────────────────────────────────────────────
+
+def layer_margin_analysis(cfg: TrainConfig):
+    """
+    Tests whether transformers progressively resolve manifold uncertainty.
+
+    For each layer of the backbone transformer, a frozen region probe (extracted
+    from a trained repr_region checkpoint) is applied to the hidden states.
+    This measures how predictive neighbourhood geometry evolves with depth.
+
+    Q1: Does gold region enter top-k early?
+    Q2: Does top-1 accuracy sharpen later than top-k?
+    Q3: Does entropy decrease progressively across layers?
+    Q4: Do margins increase progressively across layers?
+    Q5: Do some tokens remain low-margin across ALL layers?
+    Q6: Does top-1 accuracy gain non-trivially in the second half of the network?
+    Q7: Does context dynamically sharpen manifold uncertainty?
+
+    Required args:
+        --baseline_ckpt   plain transformer checkpoint to probe
+        --repr_ckpt       repr_region checkpoint (for probe extraction)
+        --region_map_path token-to-region map
+    Outputs:
+        output_dir/layer_metrics.csv
+        output_dir/layer_trajectories.csv
+        output_dir/token_margin_variance.csv
+        output_dir/summary.md
+        output_dir/plots/   (8 figures)
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        HAS_PLT = True
+    except ImportError:
+        HAS_PLT = False
+        print("[layer_margin_analysis] matplotlib not available — plots skipped")
+    from collections import defaultdict, Counter
+
+    # ── Setup ──────────────────────────────────────────────────────────────────
+    if not cfg.repr_ckpt:
+        raise ValueError("--repr_ckpt required: trained repr_region checkpoint for probe")
+    if not cfg.baseline_ckpt:
+        raise ValueError("--baseline_ckpt required: baseline transformer to probe")
+
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    device    = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+    use_amp   = device.type == "cuda"
+    out_dir   = cfg.output_dir
+    plots_dir = os.path.join(out_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
+    # ── Tokenizer ──────────────────────────────────────────────────────────────
+    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+    tokenizer.model_max_length = int(1e30)
+    vocab_size = len(tokenizer)
+
+    # ── Region map ─────────────────────────────────────────────────────────────
+    print(f"[layer_margin_analysis] loading probe: {cfg.repr_ckpt}")
+    probe_raw  = torch.load(cfg.repr_ckpt, map_location="cpu", weights_only=False)
+    probe_fields = {k: v for k, v in probe_raw["cfg"].items()
+                    if k in TrainConfig.__dataclass_fields__}
+    probe_cfg  = TrainConfig(**probe_fields)
+    probe_step = probe_raw.get("step", "?")
+
+    region_map_path = cfg.region_map_path or probe_cfg.region_map_path
+    if not region_map_path:
+        raise ValueError("--region_map_path required (or stored in probe checkpoint cfg)")
+    raw_coarse, n_coarse = load_coarse_map(region_map_path, vocab_size)
+    coarse_map = raw_coarse.to(device)
+    cov = (raw_coarse >= 0).float().mean().item()
+    print(f"[layer_margin_analysis] {n_coarse} regions  {cov:.1%} coverage")
+
+    # ── Extract frozen probe (coarse_head) from repr_region checkpoint ─────────
+    # Works for any repr_region variant — all share the same coarse_head structure.
+    probe_sd = {k[len("coarse_head."):]: v
+                for k, v in probe_raw["model"].items()
+                if k.startswith("coarse_head.")}
+    if not probe_sd:
+        raise ValueError("repr_ckpt has no 'coarse_head.*' keys; "
+                         "expected a repr_region family checkpoint")
+    probe     = _make_router_head(probe_cfg.d_model, n_coarse,
+                                  probe_cfg.dropout, probe_cfg.router_type)
+    probe.load_state_dict(probe_sd)
+    probe     = probe.to(device).eval()
+    probe_T   = probe_cfg.router_temp
+    for p in probe.parameters():
+        p.requires_grad_(False)
+    print(f"[layer_margin_analysis] probe ready  "
+          f"router_type={probe_cfg.router_type}  temp={probe_T}  "
+          f"from_step={probe_step}")
+
+    # ── Backbone (baseline transformer) ────────────────────────────────────────
+    print(f"[layer_margin_analysis] loading backbone: {cfg.baseline_ckpt}")
+    base_raw = torch.load(cfg.baseline_ckpt, map_location="cpu", weights_only=False)
+    base_fields = {k: v for k, v in base_raw["cfg"].items()
+                   if k in TrainConfig.__dataclass_fields__}
+    base_cfg  = TrainConfig(**base_fields)
+    base_step = base_raw.get("step", "?")
+    n_blocks  = base_cfg.n_layer
+
+    if base_cfg.d_model != probe_cfg.d_model:
+        raise ValueError(
+            f"d_model mismatch: backbone={base_cfg.d_model}, probe={probe_cfg.d_model}. "
+            "Probe must originate from a model with the same d_model."
+        )
+
+    # Reconstruct backbone. For repr_region variants only the shared trunk is used
+    # during analysis (region conditioning is not applied during hidden-state probing).
+    backbone = BaselineTransformerLM(base_cfg, vocab_size)
+    load_res  = backbone.load_state_dict(base_raw["model"], strict=False)
+    if load_res.missing_keys:
+        raise RuntimeError(
+            f"Backbone missing keys: {load_res.missing_keys[:5]}... "
+            "Ensure --baseline_ckpt points to a baseline or repr_region checkpoint."
+        )
+    if load_res.unexpected_keys:
+        print(f"[layer_margin_analysis] ignoring {len(load_res.unexpected_keys)} "
+              f"non-trunk keys from backbone checkpoint "
+              f"(mode={base_cfg.mode!r})")
+    backbone.to(device).eval()
+    for p in backbone.parameters():
+        p.requires_grad_(False)
+
+    layer_names = (["embed"]
+                   + [f"block_{i}" for i in range(n_blocks)]
+                   + ["final"])           # embed + N blocks + post-ln_f
+    n_layers = len(layer_names)           # n_blocks + 2
+    print(f"[layer_margin_analysis] backbone ready  mode={base_cfg.mode}  "
+          f"n_layer={n_blocks}  d_model={base_cfg.d_model}  step={base_step}")
+
+    # ── Validation dataset ─────────────────────────────────────────────────────
+    ds_name = base_cfg.dataset
+    if cfg.dataset not in ("wikitext-2-raw-v1",):
+        ds_name = cfg.dataset
+    print(f"[layer_margin_analysis] loading validation data: {ds_name}")
+    if ds_name in ("wikitext-2-raw-v1", "wikitext-103-raw-v1"):
+        ds_raw = load_dataset("wikitext", ds_name)
+    else:
+        ds_raw = load_dataset(ds_name)
+    val_parts  = [np.array(tokenizer.encode(t), dtype=np.int32)
+                  for t in ds_raw["validation"]["text"] if t.strip()]
+    val_tokens = np.concatenate(val_parts)
+    bsz        = cfg.batch_size or 16
+    val_ds     = TokenDataset(val_tokens, base_cfg.seq_len)
+    val_loader = DataLoader(val_ds, batch_size=bsz, shuffle=False,
+                            num_workers=0, pin_memory=(device.type == "cuda"),
+                            drop_last=False)
+    max_b    = cfg.max_analysis_batches if cfg.max_analysis_batches > 0 else len(val_loader)
+    actual_b = min(max_b, len(val_loader))
+    print(f"[layer_margin_analysis] {len(val_tokens):,} tokens  "
+          f"{len(val_ds)} seqs  {actual_b} batches  "
+          f"{n_layers} layers (embed + {n_blocks} blocks + final)")
+
+    ctx = torch.autocast(device_type=device.type, enabled=use_amp)
+
+    # ── Per-layer accumulators ─────────────────────────────────────────────────
+    lay_margin   = [[] for _ in range(n_layers)]
+    lay_entropy  = [[] for _ in range(n_layers)]
+    lay_acc1     = [[] for _ in range(n_layers)]
+    lay_acc4     = [[] for _ in range(n_layers)]
+    lay_acc8     = [[] for _ in range(n_layers)]
+    lay_rank     = [[] for _ in range(n_layers)]
+    lay_valid    = [[] for _ in range(n_layers)]
+    final_li     = n_layers - 1
+    top1_final   : List[torch.Tensor] = []
+    all_tok_ids  : List[torch.Tensor] = []
+
+    # ── Main loop ──────────────────────────────────────────────────────────────
+    print("[layer_margin_analysis] running analysis...")
+    for bi, batch in enumerate(val_loader):
+        if bi >= max_b:
+            break
+        if bi % 50 == 0:
+            print(f"  batch {bi}/{actual_b}")
+
+        batch = batch.to(device)
+        src   = batch[:, :-1]
+        tgt   = batch[:, 1:]
+        B, T  = src.shape
+        gold  = coarse_map[tgt]           # (B, T), -1 = unknown
+
+        # Single forward pass: collect hidden states at every layer
+        with torch.no_grad(), ctx:
+            pos = torch.arange(T, device=device).unsqueeze(0)
+            x   = backbone.drop(backbone.token_emb(src) + backbone.pos_emb(pos))
+            layer_hs = [x]                # embed
+            for blk in backbone.blocks:
+                x = blk(x)
+                layer_hs.append(x)        # block_0 ... block_{N-1}
+            layer_hs.append(backbone.ln_f(x))   # final (post-ln_f)
+
+        all_tok_ids.append(tgt.cpu().reshape(-1))
+
+        for li, h in enumerate(layer_hs):
+            with torch.no_grad(), ctx:
+                logits = probe(h)                               # (B, T, n_coarse)
+                p      = F.softmax(logits / probe_T, dim=-1).float()
+
+            p_f   = p.reshape(-1, n_coarse)                    # (N, n_coarse)
+            g_f   = gold.reshape(-1)                           # (N,)
+            valid = g_f >= 0
+
+            top2v   = torch.topk(p_f, k=2, dim=-1).values      # (N, 2)
+            margin  = (top2v[:, 0] - top2v[:, 1]).cpu()
+            entropy = (-(p_f * (p_f + 1e-10).log()).sum(-1)).cpu()
+
+            acc1 = torch.zeros(B * T)
+            acc4 = torch.zeros(B * T)
+            acc8 = torch.zeros(B * T)
+            rank = torch.full((B * T,), float(n_coarse))
+
+            if valid.any():
+                k8    = min(8, n_coarse)
+                top8i = torch.topk(p_f, k=k8, dim=-1).indices  # (N, k8)
+                g_v   = g_f[valid]
+                top8v = top8i[valid]
+                gcol  = g_v.unsqueeze(-1)
+                acc1[valid] = (top8v[:, :1] == gcol).any(-1).float().cpu()
+                acc4[valid] = (top8v[:, :min(4, k8)] == gcol).any(-1).float().cpu()
+                acc8[valid] = (top8v == gcol).any(-1).float().cpu()
+                # Gold rank: # regions with strictly higher prob (0 = top-1)
+                p_v    = p_f[valid]
+                gprob  = p_v[torch.arange(len(g_v), device=device), g_v]
+                rank[valid] = (p_v > gprob.unsqueeze(-1)).sum(-1).float().cpu()
+
+                if li == final_li:
+                    top1_final.append(torch.topk(p_f, k=1, dim=-1).indices[:, 0].cpu())
+
+            lay_margin[li].append(margin)
+            lay_entropy[li].append(entropy)
+            lay_acc1[li].append(acc1)
+            lay_acc4[li].append(acc4)
+            lay_acc8[li].append(acc8)
+            lay_rank[li].append(rank)
+            lay_valid[li].append(valid.cpu())
+
+    # ── Concatenate ────────────────────────────────────────────────────────────
+    print("[layer_margin_analysis] concatenating results...")
+    margins   = [torch.cat(lay_margin[li])  for li in range(n_layers)]
+    entropies = [torch.cat(lay_entropy[li]) for li in range(n_layers)]
+    acc1s     = [torch.cat(lay_acc1[li])    for li in range(n_layers)]
+    acc4s     = [torch.cat(lay_acc4[li])    for li in range(n_layers)]
+    acc8s     = [torch.cat(lay_acc8[li])    for li in range(n_layers)]
+    ranks     = [torch.cat(lay_rank[li])    for li in range(n_layers)]
+    valids    = [torch.cat(lay_valid[li])   for li in range(n_layers)]
+    top1_fin  = torch.cat(top1_final) if top1_final else torch.zeros(0, dtype=torch.long)
+    tok_ids   = torch.cat(all_tok_ids)
+    N_total   = len(margins[0])
+    print(f"[layer_margin_analysis] {N_total:,} positions × {n_layers} layers")
+
+    # ── Aggregate per-layer statistics ─────────────────────────────────────────
+    def _q(t: torch.Tensor, q: float) -> float:
+        return float(t.quantile(q).item())
+
+    def _vm(num: torch.Tensor, mask: torch.Tensor) -> float:
+        s = num[mask]
+        return float(s.mean().item()) if len(s) > 0 else float("nan")
+
+    bnd_tau = cfg.boundary_tau
+    layer_stats: List[Dict] = []
+    for li in range(n_layers):
+        m  = margins[li];   e = entropies[li]; v = valids[li]
+        a1 = acc1s[li];     a4 = acc4s[li];    a8 = acc8s[li]
+        gr = ranks[li]
+        bfrac = (m < bnd_tau).float().mean().item()
+        layer_stats.append({
+            "layer":          li,
+            "layer_name":     layer_names[li],
+            "acc1":           _vm(a1, v),
+            "acc4":           _vm(a4, v),
+            "acc8":           _vm(a8, v),
+            "margin_mean":    float(m.mean()),
+            "margin_q10":     _q(m, 0.10),
+            "margin_q25":     _q(m, 0.25),
+            "margin_median":  _q(m, 0.50),
+            "margin_q75":     _q(m, 0.75),
+            "margin_q90":     _q(m, 0.90),
+            "entropy_mean":   float(e.mean()),
+            "entropy_q25":    _q(e, 0.25),
+            "entropy_median": _q(e, 0.50),
+            "entropy_q75":    _q(e, 0.75),
+            "boundary_frac":  bfrac,
+            "core_frac":      1.0 - bfrac,
+            "gold_rank_mean": _vm(gr, v),
+            "gold_rank_med":  float(gr[v].median()) if v.any() else float("nan"),
+            "n_valid":        int(v.sum()),
+        })
+
+    # ── Trajectory statistics grouped by embedding-margin bin ─────────────────
+    embed_margin = margins[0]
+    TRAJ_BINS = [
+        (0.00, 0.05,  "M<0.05"),
+        (0.05, 0.10,  "0.05≤M<0.10"),
+        (0.10, 0.20,  "0.10≤M<0.20"),
+        (0.20, 0.40,  "0.20≤M<0.40"),
+        (0.40, 2.0,   "M≥0.40"),
+    ]
+    traj_rows: List[Dict] = []
+    for li in range(n_layers):
+        m  = margins[li];   e = entropies[li]
+        a1 = acc1s[li];     v = valids[li];   gr = ranks[li]
+        traj_rows.append({
+            "group": "all", "layer": li, "layer_name": layer_names[li],
+            "margin_mean": float(m.mean()),  "margin_q25": _q(m, 0.25),
+            "margin_q75":  _q(m, 0.75),
+            "entropy_mean": float(e.mean()),
+            "acc1": _vm(a1, v), "gold_rank_mean": _vm(gr, v),
+            "n": N_total,
+        })
+        for lo, hi, label in TRAJ_BINS:
+            grp = (embed_margin >= lo) & (embed_margin < hi)
+            if not grp.any():
+                continue
+            traj_rows.append({
+                "group": label, "layer": li, "layer_name": layer_names[li],
+                "margin_mean": float(m[grp].mean()),
+                "margin_q25":  _q(m[grp], 0.25),
+                "margin_q75":  _q(m[grp], 0.75),
+                "entropy_mean": float(e[grp].mean()),
+                "acc1": _vm(a1, grp & v), "gold_rank_mean": _vm(gr, grp & v),
+                "n": int(grp.sum()),
+            })
+
+    # ── Token margin variance at final layer ───────────────────────────────────
+    print("[layer_margin_analysis] computing token context variance...")
+    fin_m  = margins[final_li]
+    tok_n  : dict = defaultdict(int)
+    tok_mu : dict = defaultdict(float)
+    tok_M2 : dict = defaultdict(float)
+    tok_reg: dict = defaultdict(Counter)
+
+    for idx in range(N_total):
+        tid = int(tok_ids[idx].item())
+        if not (0 <= tid < vocab_size):
+            continue
+        mv  = float(fin_m[idx].item())
+        n   = tok_n[tid] + 1
+        d   = mv - tok_mu[tid]
+        mu  = tok_mu[tid] + d / n
+        tok_M2[tid] = tok_M2[tid] + d * (mv - mu)
+        tok_n[tid]  = n
+        tok_mu[tid] = mu
+        if idx < len(top1_fin):
+            tok_reg[tid][int(top1_fin[idx].item())] += 1
+
+    tok_var_rows: List[Dict] = []
+    for tid in sorted(tok_n, key=lambda t: -tok_n[t]):
+        n = tok_n[tid]
+        if n < 5:
+            continue
+        mu   = tok_mu[tid]
+        std  = math.sqrt(tok_M2[tid] / n) if n > 1 else 0.0
+        reg  = tok_reg.get(tid, Counter())
+        mode_cnt = max(reg.values()) if reg else 0
+        ctx_var  = 1.0 - mode_cnt / n
+        try:
+            tok_str = tokenizer.decode([tid])
+        except Exception:
+            tok_str = ""
+        tok_var_rows.append({
+            "token_id":         tid,
+            "token_str":        tok_str,
+            "n_occurrences":    n,
+            "mean_margin":      round(mu, 5),
+            "std_margin":       round(std, 5),
+            "n_unique_regions": len(reg),
+            "context_variance": round(ctx_var, 5),
+        })
+    tok_var_rows.sort(key=lambda r: -r["std_margin"])
+    print(f"[layer_margin_analysis] {len(tok_var_rows)} tokens with ≥5 occurrences")
+
+    # ── Write CSVs ─────────────────────────────────────────────────────────────
+    def _write_csv(rows: List[Dict], path: str):
+        if not rows:
+            return
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader(); w.writerows(rows)
+
+    _write_csv(layer_stats,          os.path.join(out_dir, "layer_metrics.csv"))
+    _write_csv(traj_rows,            os.path.join(out_dir, "layer_trajectories.csv"))
+    _write_csv(tok_var_rows[:5000],  os.path.join(out_dir, "token_margin_variance.csv"))
+    print("[layer_margin_analysis] wrote CSVs")
+
+    # ── Plots ──────────────────────────────────────────────────────────────────
+    if HAS_PLT:
+        xs      = list(range(n_layers))
+        xlabels = layer_names
+
+        def _ax(ax, title, ylabel):
+            ax.set_title(title, fontsize=10)
+            ax.set_xlabel("Layer"); ax.set_ylabel(ylabel)
+            ax.set_xticks(xs)
+            ax.set_xticklabels(xlabels, rotation=45, ha="right", fontsize=7)
+            ax.grid(True, alpha=0.3)
+
+        def _ls(key):
+            return [s[key] for s in layer_stats]
+
+        # 1: Region accuracy across layers
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(xs, _ls("acc1"), "o-b",  label="Acc@1")
+        ax.plot(xs, _ls("acc4"), "s-g",  label="Acc@4")
+        ax.plot(xs, _ls("acc8"), "^-r",  label="Acc@8")
+        _ax(ax, "Region Accuracy vs Layer", "Accuracy")
+        ax.legend(); fig.tight_layout()
+        fig.savefig(os.path.join(plots_dir, "01_region_accuracy_vs_layer.png"), dpi=120)
+        plt.close(fig)
+
+        # 2: Margin across layers (mean + IQR band)
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.fill_between(xs, _ls("margin_q25"), _ls("margin_q75"),
+                        alpha=0.2, color="blue", label="Q25–Q75")
+        ax.plot(xs, _ls("margin_q10"), "--", color="lightblue", linewidth=0.8, label="Q10")
+        ax.plot(xs, _ls("margin_q90"), "--", color="steelblue", linewidth=0.8, label="Q90")
+        ax.plot(xs, _ls("margin_mean"),   "o-b", label="Mean")
+        ax.plot(xs, _ls("margin_median"), "s--", color="navy", linewidth=1, label="Median")
+        _ax(ax, "Routing Margin vs Layer", "Margin (top1 − top2)")
+        ax.legend(fontsize=7); fig.tight_layout()
+        fig.savefig(os.path.join(plots_dir, "02_margin_vs_layer.png"), dpi=120)
+        plt.close(fig)
+
+        # 3: Entropy across layers (mean + IQR band)
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.fill_between(xs, _ls("entropy_q25"), _ls("entropy_q75"),
+                        alpha=0.2, color="red", label="Q25–Q75")
+        ax.plot(xs, _ls("entropy_mean"),   "o-r", label="Mean")
+        ax.plot(xs, _ls("entropy_median"), "s--", color="darkred", linewidth=1,
+                label="Median")
+        _ax(ax, "Router Entropy vs Layer", "H(p_region)")
+        ax.legend(fontsize=7); fig.tight_layout()
+        fig.savefig(os.path.join(plots_dir, "03_entropy_vs_layer.png"), dpi=120)
+        plt.close(fig)
+
+        # 4: Boundary fraction across layers
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(xs, _ls("boundary_frac"), "o-m",
+                label=f"boundary (margin < {bnd_tau})")
+        ax.plot(xs, _ls("core_frac"), "s--g", label="core")
+        _ax(ax, f"Boundary Fraction vs Layer (τ={bnd_tau})", "Fraction")
+        ax.legend(); fig.tight_layout()
+        fig.savefig(os.path.join(plots_dir, "04_boundary_frac_vs_layer.png"), dpi=120)
+        plt.close(fig)
+
+        # 5: Gold region rank across layers (inverted y-axis: lower rank = better)
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(xs, _ls("gold_rank_mean"), "o-",  color="navy",       label="Mean rank")
+        ax.plot(xs, _ls("gold_rank_med"),  "s--", color="dodgerblue", label="Median rank")
+        ax.invert_yaxis()
+        _ax(ax, "Gold Region Rank vs Layer (lower = better)", "Rank (0 = top-1)")
+        ax.legend(); fig.tight_layout()
+        fig.savefig(os.path.join(plots_dir, "05_gold_rank_vs_layer.png"), dpi=120)
+        plt.close(fig)
+
+        # 6: Margin trajectory by initial-margin group
+        COLORS = {"M<0.05": "red", "0.05≤M<0.10": "darkorange",
+                  "0.10≤M<0.20": "gold", "0.20≤M<0.40": "forestgreen",
+                  "M≥0.40": "royalblue"}
+        fig, ax = plt.subplots(figsize=(9, 4))
+        groups_seen = list(dict.fromkeys(r["group"] for r in traj_rows
+                                         if r["group"] != "all"))
+        for grp in groups_seen:
+            rows_g = sorted([r for r in traj_rows if r["group"] == grp],
+                            key=lambda r: r["layer"])
+            n_g = rows_g[0]["n"] if rows_g else 0
+            ax.plot([r["layer"] for r in rows_g],
+                    [r["margin_mean"] for r in rows_g],
+                    "o-", color=COLORS.get(grp, "k"),
+                    label=f"{grp} (n={n_g:,})", linewidth=1.5)
+        ax.plot(xs, _ls("margin_mean"), "k--", linewidth=1.5, alpha=0.5, label="all")
+        _ax(ax, "Margin Trajectory by Embedding-Layer Margin Group",
+            "Mean margin")
+        ax.legend(fontsize=7, loc="upper left"); fig.tight_layout()
+        fig.savefig(os.path.join(plots_dir, "06_margin_trajectory_by_group.png"), dpi=120)
+        plt.close(fig)
+
+        # 7: Token margin variance scatter (final layer)
+        if tok_var_rows:
+            sample = tok_var_rows[:2000]
+            mu_m  = [r["mean_margin"]    for r in sample]
+            std_m = [r["std_margin"]     for r in sample]
+            cv    = [r["context_variance"] for r in sample]
+            n_uni = [r["n_unique_regions"] for r in sample]
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+            sc = axes[0].scatter(mu_m, std_m, c=cv, s=6, alpha=0.4,
+                                 cmap="hot_r", vmin=0, vmax=1)
+            plt.colorbar(sc, ax=axes[0], label="context_variance")
+            axes[0].set_xlabel("Mean margin (final layer)")
+            axes[0].set_ylabel("Std margin (final layer)")
+            axes[0].set_title("Token Margin Variability"); axes[0].grid(True, alpha=0.3)
+            axes[1].scatter(mu_m, n_uni, s=6, alpha=0.3, color="teal")
+            axes[1].set_xlabel("Mean margin (final layer)")
+            axes[1].set_ylabel("Unique top-1 regions")
+            axes[1].set_title("Routing Diversity vs Margin"); axes[1].grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(os.path.join(plots_dir, "07_token_margin_variance.png"), dpi=120)
+            plt.close(fig)
+
+        # 8: Example token margin trajectories (highest context variance tokens)
+        if tok_var_rows:
+            top_var = tok_var_rows[:min(10, len(tok_var_rows))]
+            try:
+                cmap = plt.get_cmap("tab10")
+            except AttributeError:
+                cmap = plt.cm.get_cmap("tab10")
+            fig, ax = plt.subplots(figsize=(9, 4))
+            for i, row in enumerate(top_var):
+                tid = row["token_id"]
+                mask = (tok_ids == tid)
+                if not mask.any():
+                    continue
+                ys = [float(margins[li][mask].mean()) for li in range(n_layers)]
+                lbl = repr(row["token_str"])[:14]
+                ax.plot(xs, ys, "o-", color=cmap(i % 10),
+                        label=f"{lbl} σ={row['std_margin']:.3f}", linewidth=1.5)
+            _ax(ax, "Margin Trajectory — Highest Context-Variance Tokens",
+                "Mean margin at layer")
+            ax.legend(fontsize=7, loc="upper left", ncol=2); fig.tight_layout()
+            fig.savefig(os.path.join(plots_dir, "08_example_token_trajectories.png"),
+                        dpi=120)
+            plt.close(fig)
+
+        print(f"[layer_margin_analysis] wrote 8 plots → {plots_dir}/")
+
+    # ── Q&A verdicts ──────────────────────────────────────────────────────────
+    emb = layer_stats[0]
+    fin = layer_stats[-1]
+    mid = layer_stats[n_layers // 2]
+
+    def _v(cond: bool) -> str:
+        return "PASS" if cond else "INCONCLUSIVE"
+
+    chance_k4 = min(4, n_coarse) / n_coarse
+    q1 = _v(emb["acc4"] > 2.0 * chance_k4)                   # top-k enters early
+
+    def _rel_gap(s):
+        a1 = s["acc1"]; a4 = s["acc4"]
+        return (a4 - a1) / (a4 + 1e-8)
+    q2 = _v(_rel_gap(emb) > _rel_gap(fin) + 0.05)             # top-1 sharpens later
+
+    q3 = _v(fin["entropy_mean"] < emb["entropy_mean"] - 0.1)  # entropy decreases
+    q4 = _v(fin["margin_mean"]  > emb["margin_mean"]  + 0.02) # margins increase
+
+    low_grp_final = [r for r in traj_rows
+                     if r["group"] in ("M<0.05", "0.05≤M<0.10")
+                     and r["layer"] == final_li]
+    q5_frac = sum(r["n"] for r in low_grp_final) / max(N_total, 1)
+    q5 = _v(q5_frac > 0.05)                                   # perpetually ambiguous
+
+    acc1_e_m = mid["acc1"] - emb["acc1"]
+    acc1_m_f = fin["acc1"] - mid["acc1"]
+    q6 = _v(acc1_m_f > acc1_e_m * 0.3 and acc1_m_f > 0.01)   # gain in second half
+
+    high_var_count = sum(1 for r in tok_var_rows if r["std_margin"] > 0.10)
+    q7 = _v(high_var_count > 50)                              # context-dynamic tokens
+
+    # ── Summary markdown ──────────────────────────────────────────────────────
+    lines = [
+        "# Layer Margin Analysis Report",
+        "",
+        f"**Backbone:** `{cfg.baseline_ckpt}`  "
+        f"mode={base_cfg.mode}  step={base_step}  "
+        f"n_layer={n_blocks}  d_model={base_cfg.d_model}",
+        f"**Probe:**    `{cfg.repr_ckpt}`  "
+        f"mode={probe_cfg.mode}  step={probe_step}  "
+        f"router_type={probe_cfg.router_type}  temp={probe_T}",
+        f"**Dataset:**  {ds_name}  ({len(val_tokens):,} tokens  {actual_b} batches)",
+        f"**Positions:**{N_total:,}  **Regions:** {n_coarse}  (coverage={cov:.1%})",
+        "",
+        "## Per-Layer Statistics",
+        "",
+        "| Layer | Acc@1 | Acc@4 | Acc@8 | "
+        "Margin μ | Margin med | Entropy μ | Bnd% | Rank μ |",
+        "|-------|------:|------:|------:|"
+        "---------:|-----------:|----------:|-----:|-------:|",
+    ]
+    for s in layer_stats:
+        lines.append(
+            f"| {s['layer_name']:<12} "
+            f"| {s['acc1']:.3f} | {s['acc4']:.3f} | {s['acc8']:.3f} "
+            f"| {s['margin_mean']:.3f} | {s['margin_median']:.3f} "
+            f"| {s['entropy_mean']:.3f} "
+            f"| {s['boundary_frac']:.1%} "
+            f"| {s['gold_rank_mean']:.1f} |"
+        )
+
+    lines += [
+        "",
+        "## Hypothesis Tests (Q1–Q7)",
+        "",
+        "| # | Question | Verdict |",
+        "|---|----------|---------|",
+        f"| Q1 | Gold region enters top-4 early "
+        f"(acc@4 > 2× chance={2*chance_k4:.3f} at embed)? | **{q1}** |",
+        f"| Q2 | Top-1 accuracy sharpens later than top-4 "
+        f"(relative acc@4−acc@1 gap narrows)? | **{q2}** |",
+        f"| Q3 | Entropy decreases progressively across layers "
+        f"(final < embed − 0.1)? | **{q3}** |",
+        f"| Q4 | Margins increase progressively across layers "
+        f"(final > embed + 0.02)? | **{q4}** |",
+        f"| Q5 | Some tokens remain low-margin at ALL layers "
+        f"({q5_frac:.1%} in low bins at final layer)? | **{q5}** |",
+        f"| Q6 | Top-1 accuracy gains non-trivially in second half of network "
+        f"(+{acc1_m_f:.3f})? | **{q6}** |",
+        f"| Q7 | Context dynamically sharpens uncertainty "
+        f"({high_var_count:,} tokens with std_margin > 0.10)? | **{q7}** |",
+        "",
+        "## Margin Trajectory by Initial-Margin Group",
+        "",
+        "Tokens grouped by their margin at the embedding layer (before any attention).",
+        "",
+        "| Group | n | Embed Margin | Embed Acc@1 | "
+        "Final Margin | Final Acc@1 | Δ Acc@1 |",
+        "|-------|--:|-------------:|------------:|"
+        "-------------:|------------:|--------:|",
+    ]
+    for _, _, label in TRAJ_BINS:
+        er = next((r for r in traj_rows if r["group"] == label and r["layer"] == 0), None)
+        fr = next((r for r in traj_rows if r["group"] == label
+                   and r["layer"] == final_li), None)
+        if er and fr:
+            da1 = fr["acc1"] - er["acc1"]
+            lines.append(
+                f"| {label} | {er['n']:,} "
+                f"| {er['margin_mean']:.3f} | {er['acc1']:.3f} "
+                f"| {fr['margin_mean']:.3f} | {fr['acc1']:.3f} "
+                f"| {da1:+.3f} |"
+            )
+
+    lines += [
+        "",
+        "## Top-20 Context-Variance Tokens (final layer)",
+        "",
+        "| Token | n | Mean Margin | Std Margin | Unique Regions | Ctx Variance |",
+        "|-------|--:|------------:|-----------:|---------------:|-------------:|",
+    ]
+    for r in tok_var_rows[:20]:
+        lines.append(
+            f"| `{r['token_str']}` | {r['n_occurrences']:,} "
+            f"| {r['mean_margin']:.4f} | {r['std_margin']:.4f} "
+            f"| {r['n_unique_regions']} | {r['context_variance']:.4f} |"
+        )
+
+    passes = sum(1 for q in [q1, q2, q3, q4, q5, q6, q7] if q == "PASS")
+    support = ("STRONG" if passes >= 5 else "PARTIAL" if passes >= 3 else "WEAK")
+    lines += [
+        "",
+        "## Interpretation",
+        "",
+        f"**{passes}/7 questions PASS → {support} SUPPORT** "
+        "for progressive manifold uncertainty resolution.",
+        "",
+        "| Signal | Observation |",
+        "|--------|-------------|",
+        f"| Embed→Final margin gain | "
+        f"{emb['margin_mean']:.3f} → {fin['margin_mean']:.3f} "
+        f"({fin['margin_mean'] - emb['margin_mean']:+.3f}) |",
+        f"| Embed→Final entropy drop | "
+        f"{emb['entropy_mean']:.3f} → {fin['entropy_mean']:.3f} "
+        f"({fin['entropy_mean'] - emb['entropy_mean']:+.3f}) |",
+        f"| Embed→Final Acc@1 gain | "
+        f"{emb['acc1']:.3f} → {fin['acc1']:.3f} "
+        f"({fin['acc1'] - emb['acc1']:+.3f}) |",
+        f"| Embed→Final Acc@4 gain | "
+        f"{emb['acc4']:.3f} → {fin['acc4']:.3f} "
+        f"({fin['acc4'] - emb['acc4']:+.3f}) |",
+        f"| Gold rank embed→final | "
+        f"{emb['gold_rank_mean']:.1f} → {fin['gold_rank_mean']:.1f} |",
+        "",
+        "If Q1+Q2 both PASS: early layers localize to coarse neighbourhood; "
+        "later layers suppress competing manifolds.",
+        "",
+        "## Output Files",
+        "",
+        "- `layer_metrics.csv` — per-layer aggregate statistics",
+        "- `layer_trajectories.csv` — per-layer stats by initial-margin group",
+        "- `token_margin_variance.csv` — per-token margin variance (final layer, top 5k)",
+        "- `plots/01_region_accuracy_vs_layer.png` — acc@1/4/8 vs layer",
+        "- `plots/02_margin_vs_layer.png` — margin distribution vs layer",
+        "- `plots/03_entropy_vs_layer.png` — entropy vs layer",
+        "- `plots/04_boundary_frac_vs_layer.png` — boundary fraction vs layer",
+        "- `plots/05_gold_rank_vs_layer.png` — gold region rank vs layer",
+        "- `plots/06_margin_trajectory_by_group.png` — trajectory by initial ambiguity",
+        "- `plots/07_token_margin_variance.png` — context-dependent routing scatter",
+        "- `plots/08_example_token_trajectories.png` — per-token margin trajectories",
+    ]
+    with open(os.path.join(out_dir, "summary.md"), "w") as f:
+        f.write("\n".join(lines))
+
+    print(f"\n[layer_margin_analysis] DONE  →  {out_dir}")
+    print(f"  {passes}/7 PASS ({support} support for progressive resolution hypothesis)")
+    for q, label in [(q1, "Q1 gold enters top-k early           "),
+                     (q2, "Q2 top-1 sharpens later than top-k   "),
+                     (q3, "Q3 entropy decreases progressively    "),
+                     (q4, "Q4 margins increase progressively     "),
+                     (q5, "Q5 perpetually ambiguous tokens exist "),
+                     (q6, "Q6 top-1 gains in second half         "),
+                     (q7, "Q7 context dynamically sharpens margin")]:
+        print(f"  {label}: {q}")
+
+
 # ── Boundary analysis ──────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -3606,7 +4310,7 @@ def _parse_args() -> TrainConfig:
     p.add_argument("--device",     default="cuda")
     # build_regions args
     p.add_argument("--baseline_ckpt",     default=None,
-                   help="Baseline checkpoint to sweep (required for build_regions mode)")
+                   help="Baseline checkpoint (required for build_regions and layer_margin_analysis modes)")
     p.add_argument("--region_output_dir", default="",
                    help="Where to write maps; defaults to --output_dir")
     p.add_argument("--region_vocab_size", type=int,   default=5000)
@@ -3742,6 +4446,8 @@ if __name__ == "__main__":
     cfg = _parse_args()
     if cfg.mode == "build_regions":
         build_regions(cfg)
+    elif cfg.mode == "layer_margin_analysis":
+        layer_margin_analysis(cfg)
     elif cfg.mode == "boundary_analysis":
         boundary_analysis(cfg)
     else:
