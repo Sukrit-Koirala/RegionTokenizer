@@ -371,25 +371,31 @@ def _read_summary(d):
     return json.load(open(p))
 
 def _read_knn(d):
-    p = os.path.join(d, "knn", "metrics_all.csv")
-    if not os.path.exists(p):
+    # Try both old (knn/) and new (knn_raw_h_500k/) output dirs
+    for sub in ("knn", "knn_raw_h_500k", "knn_raw_h"):
+        p = os.path.join(d, sub, "metrics_all.csv")
+        if os.path.exists(p):
+            break
+    else:
         return {}
     rows = list(csv.DictReader(open(p)))
-    # router row and mem row
     out = {}
     for r in rows:
-        if r.get("policy") == "mem_only" or r.get("label") == "mem_only":
-            out["knn_acc1"] = float(r.get("region_acc1", r.get("acc1", 0)))
-        if r.get("policy") == "router" or r.get("label") == "router":
-            out["router_acc1"] = float(r.get("region_acc1", r.get("acc1", 0)))
+        method = r.get("method", "")
+        if method == "mem_weighted":
+            out["knn_acc1"] = float(r.get("acc1", 0) or 0)
+            out["knn_nll"]  = float(r.get("region_nll", 0) or 0)
+        if method == "router":
+            out["router_acc1"] = float(r.get("acc1", 0) or 0)
+            out["router_nll"]  = float(r.get("region_nll", 0) or 0)
     return out
 
 lines = [
     "# Region-Retrieval LM Comparison\n",
     f"Date: {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M')}\n",
     "",
-    "| Run | val_ppl | coarse_acc@1 | kNN acc@1 | router acc@1 |",
-    "|-----|---------|--------------|-----------|--------------|",
+    "| Run | val_ppl | coarse_acc@1 | kNN acc@1 | kNN NLL | router acc@1 |",
+    "|-----|---------|--------------|-----------|---------|--------------|",
 ]
 
 ref_ppl = None
@@ -400,12 +406,13 @@ for label, d in runs:
     k = _read_knn(d)
     ppl     = s.get("val_ppl",          float("nan"))
     cacc    = s.get("val_coarse_acc1",  float("nan"))
-    knn_a1  = k.get("knn_acc1",         float("nan"))
-    rtr_a1  = k.get("router_acc1",      float("nan"))
+    knn_a1  = k.get("knn_acc1",    float("nan"))
+    rtr_a1  = k.get("router_acc1", float("nan"))
+    knn_nll = k.get("knn_nll",     float("nan"))
     if label == "reference":
         ref_ppl = ppl
         ref_knn = knn_a1
-    lines.append(f"| {label:<18} | {ppl:7.2f} | {cacc:12.3f} | {knn_a1:9.3f} | {rtr_a1:12.3f} |")
+    lines.append(f"| {label:<18} | {ppl:7.2f} | {cacc:12.3f} | {knn_a1:9.3f} | {knn_nll:8.3f} | {rtr_a1:12.3f} |")
 
 lines += [
     "",

@@ -62,10 +62,13 @@ except ImportError:
 _PROJ_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _PROJ_ROOT)
 try:
-    from train_region_lm import BaselineTransformerLM, TrainConfig, _make_router_head
+    from train_region_lm import (BaselineTransformerLM, TrainConfig, _make_router_head,
+                                  ReprRegionTransformerLM, ReprRegionRetrievalLM)
     _HAS_TRAIN_LM = True
 except ImportError:
     _HAS_TRAIN_LM = False
+    ReprRegionTransformerLM = None  # type: ignore
+    ReprRegionRetrievalLM   = None  # type: ignore
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -308,7 +311,17 @@ def compute_all_mixtures(p_r: torch.Tensor, p_m: torch.Tensor,
 # ── Model loading ─────────────────────────────────────────────────────────────
 
 def load_small_backbone_and_probe(ckpt_path: str, device: torch.device):
-    """Returns (backbone, probe_or_None, d_model, cfg_dict)."""
+    """
+    Returns (backbone, probe_or_None, d_model, cfg_dict, vocab_size).
+
+    backbone: model loaded from checkpoint.  Always exposes trunk attrs
+              (token_emb, pos_emb, drop, blocks, ln_f) for get_hs_small.
+              When checkpoint mode is repr_region_retrieval:
+                backbone is ReprRegionRetrievalLM → has .retrieval_proj
+              When checkpoint mode is repr_region*:
+                backbone is ReprRegionTransformerLM → has .region_proj etc.
+              Otherwise: BaselineTransformerLM.
+    """
     if not _HAS_TRAIN_LM:
         raise RuntimeError("train_region_lm.py not importable; set PYTHONPATH=$PWD")
 
@@ -324,10 +337,30 @@ def load_small_backbone_and_probe(ckpt_path: str, device: torch.device):
     tokenizer.model_max_length = int(1e30)
     vocab_size = len(tokenizer)
 
-    backbone = BaselineTransformerLM(cfg, vocab_size)
+    # Choose model class from checkpoint contents / mode
+    ckpt_mode    = cfg_dict.get("mode", "baseline")
+    has_retrieval = any(k.startswith("retrieval_proj.") for k in raw["model"])
+    _REPR_MODES   = ("repr_region", "oracle_repr_region", "random_repr_region",
+                     "repr_region_retrieval", "random_repr_region_retrieval")
+    dummy_map = torch.zeros(vocab_size, dtype=torch.long)
+
+    if has_retrieval and ReprRegionRetrievalLM is not None:
+        backbone = ReprRegionRetrievalLM(cfg, vocab_size, coarse_map=dummy_map)
+        print(f"[load_small] loading ReprRegionRetrievalLM  (has retrieval_proj)")
+    elif ckpt_mode in _REPR_MODES and ReprRegionTransformerLM is not None:
+        backbone = ReprRegionTransformerLM(cfg, vocab_size, coarse_map=dummy_map)
+        print(f"[load_small] loading ReprRegionTransformerLM  mode={ckpt_mode}")
+    else:
+        backbone = BaselineTransformerLM(cfg, vocab_size)
+        print(f"[load_small] loading BaselineTransformerLM  mode={ckpt_mode}")
+
     load_res = backbone.load_state_dict(raw["model"], strict=False)
-    if load_res.missing_keys:
-        raise RuntimeError(f"Missing backbone keys: {load_res.missing_keys[:5]}")
+    # Only error on trunk keys missing (coarse_head/retrieval_proj absence is fine for baseline)
+    trunk_prefixes = ("token_emb.", "pos_emb.", "ln_f.", "blocks.", "drop.")
+    missing_trunk  = [k for k in load_res.missing_keys
+                      if any(k.startswith(p) for p in trunk_prefixes)]
+    if missing_trunk:
+        raise RuntimeError(f"Missing backbone trunk keys: {missing_trunk[:5]}")
     backbone.to(device).eval()
     for p in backbone.parameters():
         p.requires_grad_(False)
@@ -476,7 +509,7 @@ def load_wikitext(dataset_name: str, tokenizer, split: str) -> np.ndarray:
 # ── Memory construction ───────────────────────────────────────────────────────
 
 def build_or_load_memory(
-    get_hs_fn,
+    get_key_fn,
     coarse_map: torch.Tensor,
     train_loader: DataLoader,
     max_positions: int,
@@ -484,7 +517,12 @@ def build_or_load_memory(
     mem_index: MemoryIndex,
     device: torch.device,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Returns (keys_f16, regions, tokens) numpy arrays and populates mem_index."""
+    """
+    Returns (keys_f16, regions, tokens) numpy arrays and populates mem_index.
+
+    get_key_fn(src) -> (h_raw, key)  where key is the vector stored in memory.
+    For raw_h: h_raw == key.  For retrieval_proj: key is the projected vector.
+    """
     keys_path    = os.path.join(out_dir, "memory_keys.npy")
     regions_path = os.path.join(out_dir, "memory_regions.npy")
     tokens_path  = os.path.join(out_dir, "memory_tokens.npy")
@@ -522,17 +560,17 @@ def build_or_load_memory(
 
         batch = batch.to(device)
         src   = batch[:, :-1]   # (B, T)
-        tgt   = batch[:, 1:]    # (B, T)  — aligned: h[:, t, :] predicts tgt[:, t]
+        tgt   = batch[:, 1:]    # (B, T)  — aligned: key[:, t, :] predicts tgt[:, t]
 
-        h       = get_hs_fn(src)                    # (B, T, d_model) float32
-        h_flat  = h.reshape(-1, h.shape[-1])        # (B*T, d_model)
-        regions = coarse_map[tgt].reshape(-1)       # (B*T,) on device
-        valid   = regions >= 0
+        _, key    = get_key_fn(src)                  # (B, T, key_dim) float32
+        key_flat  = key.reshape(-1, key.shape[-1])   # (B*T, key_dim)
+        regions   = coarse_map[tgt].reshape(-1)      # (B*T,) on device
+        valid     = regions >= 0
 
         if not valid.any():
             continue
 
-        h_valid = h_flat[valid].cpu().numpy().astype(np.float16)
+        h_valid = key_flat[valid].cpu().numpy().astype(np.float16)
         r_valid = regions[valid].cpu().numpy().astype(np.int32)
         t_valid = tgt.reshape(-1)[valid].cpu().numpy().astype(np.int32)
 
@@ -563,7 +601,7 @@ def build_or_load_memory(
 # ── Evaluation loop ───────────────────────────────────────────────────────────
 
 def run_eval(
-    get_hs_fn,
+    get_key_fn,
     probe: Optional[nn.Module],
     probe_temp: float,
     mem_index: MemoryIndex,
@@ -582,6 +620,10 @@ def run_eval(
         p_mem_w:     (N, n_coarse) weighted vote
         p_mem_uw:    (N, n_coarse) unweighted vote
         gold:        (N,) long
+
+    get_key_fn(src) -> (h_raw, key)
+        h_raw: raw hidden state for probe  (B, T, d_model)
+        key:   kNN query vector            (B, T, key_dim)  — may equal h_raw
     """
     all_p_router:  List[torch.Tensor] = []
     all_p_mem_w:   List[torch.Tensor] = []
@@ -605,22 +647,22 @@ def run_eval(
         if not valid.any():
             continue
 
-        h       = get_hs_fn(src)               # (B, T, d_model)
-        h_flat  = h.reshape(-1, h.shape[-1])   # (B*T, d_model) float32, on device
+        h_raw, key = get_key_fn(src)                      # model forward (once)
+        h_flat     = h_raw.reshape(-1, h_raw.shape[-1])   # (B*T, d_model) — for probe
+        key_flat   = key.reshape(-1, key.shape[-1])        # (B*T, key_dim) — for kNN
 
-        # Positions to retrieve for
-        h_valid = h_flat[valid].cpu().numpy().astype(np.float32)   # kNN is CPU
-        n_v     = len(h_valid)
+        # kNN retrieval (CPU numpy)
+        k_valid = key_flat[valid].cpu().numpy().astype(np.float32)
+        n_v     = len(k_valid)
 
-        # kNN retrieval
-        sims, nn_idx = mem_index.search(h_valid, knn_k)           # (n_v, k)
-        nn_regs      = memory_regions[nn_idx]                      # (n_v, k) int32
+        sims, nn_idx = mem_index.search(k_valid, knn_k)   # (n_v, k)
+        nn_regs      = memory_regions[nn_idx]              # (n_v, k) int32
 
         nn_regs_t = torch.tensor(nn_regs.astype(np.int64), dtype=torch.long)
         sims_t    = torch.tensor(sims, dtype=torch.float32)
 
         # Weighted vote
-        w         = F.softmax(sims_t / knn_temp, dim=-1)          # (n_v, k)
+        w         = F.softmax(sims_t / knn_temp, dim=-1)  # (n_v, k)
         p_mw      = torch.zeros(n_v, n_coarse)
         p_mw.scatter_add_(1, nn_regs_t, w)
         p_mw      = normalize_dist(p_mw)
@@ -631,11 +673,11 @@ def run_eval(
         p_muw.scatter_add_(1, nn_regs_t, uw)
         p_muw     = normalize_dist(p_muw)
 
-        # Router
+        # Router: always uses raw hidden state h, not the projected key
         p_r = None
         if probe is not None:
             with torch.no_grad():
-                logits = probe(h_flat[valid])  # GPU
+                logits = probe(h_flat[valid])              # GPU, raw h
             p_r = F.softmax(logits.float() / probe_temp, dim=-1).cpu()
 
         all_p_mem_w.append(p_mw)
@@ -897,12 +939,14 @@ def write_summary(path: str, args, cfg_summary: Dict,
     lines = [
         "# Offline Region-kNN Experiment Report",
         "",
-        f"**Model:**   `{args.model_type}`"
+        f"**Model:**      `{args.model_type}`"
         + (f"  knn_layer={args.knn_layer}" if args.model_type == "gpt2xl" else ""),
-        f"**Dataset:** {args.dataset}",
-        f"**Memory:**  {n_mem:,} positions  (train split)",
-        f"**Eval:**    {n_eval:,} positions  (val split)",
-        f"**Regions:** {n_coarse}  knn_k={args.knn_k}  knn_temp={args.knn_temp}  "
+        f"**Key source:** `{args.knn_key_source}`  "
+        f"key_dim={cfg_summary.get('key_dim', '?')}",
+        f"**Dataset:**    {args.dataset}",
+        f"**Memory:**     {n_mem:,} positions  (train split)",
+        f"**Eval:**       {n_eval:,} positions  (val split)",
+        f"**Regions:**    {n_coarse}  knn_k={args.knn_k}  knn_temp={args.knn_temp}  "
         f"normalize={args.normalize_keys}",
         "",
         "## Overall Metrics (all valid positions)",
@@ -1034,6 +1078,13 @@ def main() -> None:
     parser.add_argument("--knn_layer",   default="block_41",
                         help="Layer to use as kNN key (gpt2xl mode): "
                              "embed | block_0 ... block_47")
+    parser.add_argument("--knn_key_source", default="raw_h",
+                        choices=["raw_h", "retrieval_proj", "post_region"],
+                        help="Vector to use as kNN key: "
+                             "raw_h (default) = trunk hidden state; "
+                             "retrieval_proj  = backbone.retrieval_proj(h), requires "
+                             "repr_region_retrieval checkpoint; "
+                             "post_region     = h after region injection")
     # Data
     parser.add_argument("--dataset",     default="wikitext-103-raw-v1")
     parser.add_argument("--region_map_path", required=True)
@@ -1070,6 +1121,7 @@ def main() -> None:
     plots_dir = os.path.join(args.output_dir, "plots")
     print(f"[region_knn] device={device}  model_type={args.model_type}  "
           f"knn_k={args.knn_k}  knn_temp={args.knn_temp}")
+    print(f"[region_knn] knn_key_source={args.knn_key_source}")
     if _HAS_FAISS:
         print("[region_knn] FAISS available")
     else:
@@ -1077,6 +1129,7 @@ def main() -> None:
 
     # ── Load model + probe ────────────────────────────────────────────────────
     vocab_size = 50257  # GPT-2 default; overridden below
+    backbone   = None   # set below for small model
     if args.model_type == "gpt2xl":
         if args.hf_cache_dir:
             os.environ.setdefault("HF_HOME", args.hf_cache_dir)
@@ -1095,6 +1148,52 @@ def main() -> None:
             load_small_backbone_and_probe(args.small_ckpt, device)
         def get_hs(src: torch.Tensor) -> torch.Tensor:
             return get_hs_small(backbone, src, device)
+
+    # ── kNN key-source function ───────────────────────────────────────────────
+    # get_key_fn(src) -> (h_raw, key)
+    #   h_raw: (B, T, d_model) float32 — always raw trunk output (for probe)
+    #   key:   (B, T, key_dim) float32 — vector indexed / queried in kNN memory
+    if args.knn_key_source == "raw_h":
+        key_dim = d_model
+        def get_key_fn(src: torch.Tensor):
+            h = get_hs(src)
+            return h, h
+
+    elif args.knn_key_source == "retrieval_proj":
+        if backbone is None or not hasattr(backbone, "retrieval_proj"):
+            parser.error(
+                "--knn_key_source retrieval_proj requires a repr_region_retrieval "
+                "checkpoint (backbone must have .retrieval_proj).  "
+                "Check --small_ckpt was trained with mode=repr_region_retrieval."
+            )
+        key_dim = backbone.retrieval_proj[-1].weight.shape[0]
+        def get_key_fn(src: torch.Tensor):
+            h = get_hs(src)                                 # (B, T, d_model)
+            with torch.no_grad():
+                flat = h.reshape(-1, d_model)
+                z    = backbone.retrieval_proj(flat)        # (B*T, retrieval_dim)
+                z    = F.normalize(z.float(), dim=-1)       # unit sphere
+                key  = z.reshape(h.shape[0], h.shape[1], key_dim)
+            return h, key
+
+    elif args.knn_key_source == "post_region":
+        if backbone is None or not hasattr(backbone, "region_proj"):
+            parser.error(
+                "--knn_key_source post_region requires a repr_region* checkpoint "
+                "(backbone must have .region_proj)."
+            )
+        key_dim = d_model
+        def get_key_fn(src: torch.Tensor):
+            with torch.no_grad():
+                _, _, _, h_prime = backbone.forward(src)    # h' = h + alpha * region_feat
+            # For probe we need raw h.  ReprRegionRetrievalLM stores _last_h.
+            if hasattr(backbone, "_last_h") and backbone._last_h is not None:
+                h_raw = backbone._last_h.float()
+            else:
+                h_raw = get_hs(src)                         # second trunk pass (fallback)
+            return h_raw, h_prime.float()
+
+    print(f"[region_knn] key_dim={key_dim}")
 
     # ── Region map ────────────────────────────────────────────────────────────
     print(f"[region_knn] loading region map: {args.region_map_path}")
@@ -1155,9 +1254,9 @@ def main() -> None:
                               pin_memory=(device.type == "cuda"), drop_last=False)
 
     # ── Build / load memory ───────────────────────────────────────────────────
-    mem_index = MemoryIndex(d_model, device, normalize=args.normalize_keys)
+    mem_index = MemoryIndex(key_dim, device, normalize=args.normalize_keys)
     keys_f16, mem_regions, mem_tokens = build_or_load_memory(
-        get_hs, coarse_map, train_loader,
+        get_key_fn, coarse_map, train_loader,
         args.max_memory_positions, args.output_dir, mem_index, device,
     )
     n_mem = len(keys_f16)
@@ -1166,7 +1265,7 @@ def main() -> None:
     # ── Evaluate ──────────────────────────────────────────────────────────────
     print("[region_knn] evaluating ...")
     p_router, p_mem_w, p_mem_uw, gold_all = run_eval(
-        get_hs, probe, args.probe_temp,
+        get_key_fn, probe, args.probe_temp,
         mem_index, mem_regions, coarse_map,
         val_loader, max_eval_batches,
         n_coarse, args.knn_k, args.knn_temp, device,
@@ -1357,6 +1456,8 @@ def main() -> None:
         "model_type":          args.model_type,
         "model_name":          getattr(args, "model_name", None),
         "knn_layer":           args.knn_layer if args.model_type == "gpt2xl" else "final",
+        "knn_key_source":      args.knn_key_source,
+        "key_dim":             key_dim,
         "dataset":             args.dataset,
         "region_map_path":     args.region_map_path,
         "n_coarse":            n_coarse,
