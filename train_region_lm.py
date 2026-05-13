@@ -45,6 +45,7 @@ _MODES = ("baseline", "coarse", "coarse_leaf", "random_control", "oracle_coarse"
           "repr_region_branchattn", "repr_region_branch_identity",
           "repr_region_boundary_seqrefine", "random_repr_region_boundary_seqrefine",
           "repr_region_boundary_adaptivedepth", "random_repr_region_boundary_adaptivedepth",
+          "repr_region_retrieval", "random_repr_region_retrieval",
           "layer_margin_analysis",
           "boundary_analysis")
 
@@ -143,6 +144,13 @@ class TrainConfig:
     # boundary_analysis mode
     repr_ckpt: Optional[str] = None        # trained repr_region checkpoint to analyse
     max_analysis_batches: int = 200        # val batches to process (0 = all)
+    # repr_region_retrieval mode
+    retrieval_loss_type: str = "proxy"               # "proxy" | "supcon"
+    lambda_retrieval: float = 0.0                    # weight on retrieval metric loss
+    retrieval_dim: int = 128                         # projection head output dimension
+    retrieval_temp: float = 0.07                     # temperature for proxy/supcon loss
+    retrieval_key_source: str = "pre_region"         # "pre_region" (h) | "post_region" (h')
+    max_retrieval_positions_per_batch: int = 2048    # subsample cap for supcon
 
 
 # ── Transformer blocks ────────────────────────────────────────────────────────
@@ -2023,6 +2031,147 @@ class ReprRegionBranchAttnLM(nn.Module):
                 "total": total, "non_emb": total - self.token_emb.weight.numel()}
 
 
+class ReprRegionRetrievalLM(ReprRegionTransformerLM):
+    """
+    ReprRegionTransformerLM + metric-learning loss that makes pre-region
+    hidden states cluster by next-token region label.
+
+    Two loss variants (cfg.retrieval_loss_type):
+      "proxy"  — CE over learned normalized region centroids (cheap, stable)
+      "supcon" — supervised contrastive loss (richer, subsampled for memory)
+
+    cfg.retrieval_key_source:
+      "pre_region"  — train on h before region injection; matches kNN key convention
+      "post_region" — train on h' after injection
+    """
+
+    def __init__(self, cfg: TrainConfig, vocab_size: int, coarse_map: torch.Tensor):
+        super().__init__(cfg, vocab_size, coarse_map)
+        d, r = cfg.d_model, cfg.retrieval_dim
+        self.retrieval_proj = nn.Sequential(
+            nn.LayerNorm(d),
+            nn.Linear(d, d, bias=False),
+            nn.GELU(),
+            nn.Linear(d, r, bias=False),
+        )
+        if cfg.retrieval_loss_type == "proxy":
+            self.region_centroids = nn.Embedding(cfg.n_coarse, r)
+            nn.init.normal_(self.region_centroids.weight, std=0.02)
+        self.retrieval_proj.apply(_init_weights)
+        self._last_h: Optional[torch.Tensor] = None
+
+    def forward(
+        self,
+        idx: torch.Tensor,
+        oracle_region: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Same as parent but caches h (pre-region) in self._last_h."""
+        B, T = idx.shape
+        pos = torch.arange(T, device=idx.device).unsqueeze(0)
+        x = self.drop(self.token_emb(idx) + self.pos_emb(pos))
+        for block in self.blocks:
+            x = block(x)
+        h = self.ln_f(x)
+        self._last_h = h                                        # pre-region key
+
+        region_logits = self.coarse_head(h)
+
+        if oracle_region is not None:
+            known = oracle_region >= 0
+            p_region = torch.full(
+                (B, T, self.cfg.n_coarse), 1.0 / self.cfg.n_coarse, device=idx.device,
+            )
+            oh = F.one_hot(oracle_region.clamp(min=0),
+                           num_classes=self.cfg.n_coarse).float()
+            p_region = torch.where(known.unsqueeze(-1), oh, p_region)
+        else:
+            p_region = F.softmax(region_logits / self.cfg.router_temp, dim=-1)
+
+        r           = p_region @ self.region_emb.weight
+        region_feat = self.region_proj(self.region_mlp(r))
+        h_prime     = h + self.current_alpha * region_feat
+
+        return self.lm_head(h_prime), region_logits, p_region, h_prime
+
+    def loss(self, idx: torch.Tensor) -> Dict[str, torch.Tensor]:
+        src = idx[:, :-1]
+        tgt = idx[:, 1:]
+
+        lm_logits, region_logits, _, h_prime = self.forward(src)
+        l_lm  = F.cross_entropy(lm_logits.reshape(-1, self.vocab_size), tgt.reshape(-1))
+        total = l_lm
+        losses: Dict[str, torch.Tensor] = {"lm": l_lm}
+
+        if self.coarse_map is not None:
+            coarse_labels = self.coarse_map[tgt]
+            valid = coarse_labels >= 0
+            if valid.any():
+                l_c = F.cross_entropy(
+                    region_logits.reshape(-1, self.cfg.n_coarse)[valid.reshape(-1)],
+                    coarse_labels.reshape(-1)[valid.reshape(-1)],
+                )
+                total = total + self.cfg.lambda_coarse * l_c
+                losses["coarse"] = l_c
+            p_c   = F.softmax(region_logits, dim=-1)
+            l_bal = -(p_c * (p_c + 1e-8).log()).sum(-1).mean().neg()
+            total = total + self.cfg.lambda_balance * l_bal
+            losses["balance_coarse"] = l_bal
+
+            if self.cfg.lambda_retrieval > 0.0 and valid.any():
+                h_key = (self._last_h
+                         if self.cfg.retrieval_key_source == "pre_region" else h_prime)
+                h_flat     = h_key.reshape(-1, self.cfg.d_model)
+                lbl_flat   = coarse_labels.reshape(-1)
+                valid_flat = valid.reshape(-1)
+                h_valid    = h_flat[valid_flat]
+                lbl_valid  = lbl_flat[valid_flat]
+                N_valid = len(h_valid)
+                max_p = self.cfg.max_retrieval_positions_per_batch
+                if N_valid > max_p:
+                    perm      = torch.randperm(N_valid, device=h_valid.device)[:max_p]
+                    h_valid   = h_valid[perm]
+                    lbl_valid = lbl_valid[perm]
+                z = F.normalize(self.retrieval_proj(h_valid), dim=-1)
+
+                if self.cfg.retrieval_loss_type == "proxy":
+                    c = F.normalize(self.region_centroids.weight, dim=-1)
+                    logits_metric = (z @ c.T) / self.cfg.retrieval_temp
+                    l_retr = F.cross_entropy(logits_metric, lbl_valid)
+                    losses["retrieval"] = l_retr
+                    with torch.no_grad():
+                        losses["retrieval_acc1"] = torch.tensor(
+                            topk_accuracy(logits_metric, lbl_valid, 1))
+                        losses["retrieval_acc4"] = torch.tensor(
+                            topk_accuracy(logits_metric, lbl_valid, 4))
+                else:  # supcon
+                    l_retr = _supcon_loss(z, lbl_valid, self.cfg.retrieval_temp)
+                    losses["retrieval"] = l_retr
+                total = total + self.cfg.lambda_retrieval * l_retr
+
+        losses["total"] = total
+        return losses
+
+    def param_breakdown(self) -> Dict[str, int]:
+        seen: set = set()
+        def _n(m: nn.Module) -> int:
+            c = 0
+            for p in m.parameters():
+                if id(p) not in seen:
+                    seen.add(id(p)); c += p.numel()
+            return c
+        emb    = _n(self.token_emb) + _n(self.pos_emb)
+        trunk  = sum(_n(b) for b in self.blocks) + _n(self.ln_f)
+        router = (_n(self.coarse_head) + _n(self.region_emb)
+                  + _n(self.region_mlp) + _n(self.region_proj))
+        refiner = _n(self.retrieval_proj)
+        if hasattr(self, "region_centroids"):
+            refiner += _n(self.region_centroids)
+        _n(self.lm_head)  # weight-tied → 0
+        total = self.param_count()
+        return {"emb": emb, "trunk": trunk, "router": router, "refiner": refiner,
+                "total": total, "non_emb": total - self.token_emb.weight.numel()}
+
+
 # ── Region map loaders ─────────────────────────────────────────────────────────
 
 def load_coarse_map(path: str, vocab_size: int) -> Tuple[torch.Tensor, int]:
@@ -2215,6 +2364,27 @@ def _compute_usage_stats(usage: torch.Tensor, eps: float = 1e-8) -> Dict[str, fl
     }
 
 
+def _supcon_loss(z: torch.Tensor, labels: torch.Tensor, temp: float) -> torch.Tensor:
+    """Supervised contrastive loss. z: (N, D) unit-normalized, labels: (N,) int >= 0."""
+    N = len(z)
+    if N <= 1:
+        return z.sum() * 0.0
+    sim = (z @ z.T) / temp
+    sim_max = sim.detach().max(dim=1, keepdim=True).values
+    sim = sim - sim_max
+    exp_sim = torch.exp(sim)
+    mask_self = torch.eye(N, device=z.device, dtype=torch.float32)
+    mask_pos  = (labels.unsqueeze(1) == labels.unsqueeze(0)).float() - mask_self
+    has_pos   = mask_pos.sum(1) > 0
+    if not has_pos.any():
+        return z.sum() * 0.0
+    denom    = (exp_sim * (1.0 - mask_self)).sum(1)
+    pos_sum  = (exp_sim * mask_pos).sum(1)
+    n_pos    = mask_pos.sum(1).clamp(min=1)
+    loss_per = -torch.log((pos_sum[has_pos] + 1e-8) / (denom[has_pos] + 1e-8)) / n_pos[has_pos]
+    return loss_per.mean()
+
+
 # ── Evaluation ─────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -2249,6 +2419,10 @@ def evaluate(
     bnd_alpha_buf: List[float] = []   # avg alpha_dyn at boundary
     core_alpha_buf:List[float] = []   # avg alpha_dyn at core
     bnd_frac_buf:  List[float] = []   # fraction of positions classified as boundary
+    # ReprRegionRetrievalLM metric-learning accumulators
+    retr_loss_buf:  List[float] = []
+    retr_acc1_buf:  List[float] = []
+    retr_acc4_buf:  List[float] = []
 
     for i, batch in enumerate(loader):
         if i >= max_batches:
@@ -2264,6 +2438,12 @@ def evaluate(
             aux_c.append(losses["coarse"].item())
         if "leaf" in losses:
             aux_l.append(losses["leaf"].item())
+        if "retrieval" in losses:
+            retr_loss_buf.append(losses["retrieval"].item())
+        if "retrieval_acc1" in losses:
+            retr_acc1_buf.append(losses["retrieval_acc1"].item())
+        if "retrieval_acc4" in losses:
+            retr_acc4_buf.append(losses["retrieval_acc4"].item())
 
         if isinstance(model, RegionConditionedTransformerLM):
             with ctx:
@@ -2373,6 +2553,10 @@ def evaluate(
         "val_boundary_frac":    avg(bnd_frac_buf),
         "val_avg_boundary_alpha": avg(bnd_alpha_buf),
         "val_avg_core_alpha":     avg(core_alpha_buf),
+        # ReprRegionRetrievalLM metric-learning
+        "val_retrieval_loss":  avg(retr_loss_buf),
+        "val_retrieval_acc1":  avg(retr_acc1_buf),
+        "val_retrieval_acc4":  avg(retr_acc4_buf),
         # Refiner-specific scales (0.0 for non-applicable models)
         "val_branch_scale": (
             float(torch.tanh(model.branch_refiner.branch_scale).item())
@@ -2442,7 +2626,8 @@ def train(cfg: TrainConfig):
                          "random_repr_region", "random_repr_region_capacity",
                          "random_repr_region_boundary", "random_repr_region_multihyp",
                          "random_repr_region_boundary_seqrefine",
-                         "random_repr_region_boundary_adaptivedepth")
+                         "random_repr_region_boundary_adaptivedepth",
+                         "random_repr_region_retrieval")
         if cfg.mode in _RANDOM_MODES:
             raw_coarse = make_random_partition_map(raw_coarse, cfg.n_coarse, seed=cfg.seed)
         coarse_map = raw_coarse.to(device)
@@ -2506,6 +2691,9 @@ def train(cfg: TrainConfig):
     elif cfg.mode in ("repr_region_branchattn", "repr_region_branch_identity"):
         assert coarse_map is not None, f"{cfg.mode} requires --region_map_path"
         model = ReprRegionBranchAttnLM(cfg, vocab_size, coarse_map=coarse_map)
+    elif cfg.mode in ("repr_region_retrieval", "random_repr_region_retrieval"):
+        assert coarse_map is not None, f"{cfg.mode} requires --region_map_path"
+        model = ReprRegionRetrievalLM(cfg, vocab_size, coarse_map=coarse_map)
     else:
         model = RegionConditionedTransformerLM(
             cfg, vocab_size, coarse_map=coarse_map, leaf_map=leaf_map,
@@ -2542,7 +2730,9 @@ def train(cfg: TrainConfig):
         "step", "train_lm_loss", "train_total_loss",
         "val_lm_loss", "val_ppl",
         "train_aux_coarse", "train_aux_leaf", "train_aux_balance", "train_aux_diversity",
+        "train_retrieval_loss", "train_retrieval_acc1", "train_retrieval_acc4",
         "val_aux_coarse", "val_aux_leaf",
+        "val_retrieval_loss", "val_retrieval_acc1", "val_retrieval_acc4",
         "val_coarse_acc1", "val_coarse_acc4",
         "val_leaf_acc1", "val_leaf_acc8", "val_leaf_acc32",
         "val_coarse_ent", "val_leaf_ent",
@@ -2625,9 +2815,17 @@ def train(cfg: TrainConfig):
             alpha = getattr(model, "current_alpha", 0.0)
             beta  = getattr(model, "current_beta",  0.0)
             rtemp = getattr(model, "current_router_temp", 0.0)
+            _retr_str = ""
+            if isinstance(model, ReprRegionRetrievalLM) and "retrieval" in losses:
+                _retr_str = (
+                    f"  retr={losses['retrieval'].item():.4f}"
+                    + (f"  r@1={losses['retrieval_acc1'].item():.3f}"
+                       if "retrieval_acc1" in losses else "")
+                )
             print(
                 f"step {step:6d}  lm={ema_lm:.4f}  total={ema_total:.4f}"
                 f"  lr={lr:.2e}  α={alpha:.3f}  β={beta:.4f}  T={rtemp:.2f}  tok/s={tps:.0f}"
+                + _retr_str
             )
             # ── Gradient norm diagnostics for boundary refiner modes ─────────
             if isinstance(model, (ReprRegionBranchAttnLM, ReprRegionBoundarySeqRefineLM,
@@ -2670,6 +2868,9 @@ def train(cfg: TrainConfig):
                 "train_aux_leaf":       losses.get("leaf",           torch.zeros(1)).item(),
                 "train_aux_balance":    losses.get("balance_coarse", torch.zeros(1)).item(),
                 "train_aux_diversity":  losses.get("diversity",      torch.zeros(1)).item(),
+                "train_retrieval_loss": losses.get("retrieval",      torch.zeros(1)).item(),
+                "train_retrieval_acc1": losses.get("retrieval_acc1", torch.zeros(1)).item(),
+                "train_retrieval_acc4": losses.get("retrieval_acc4", torch.zeros(1)).item(),
                 "lr":                lr,
                 "tokens_per_sec":    int(tps),
                 "n_params":          n_params,
@@ -2694,12 +2895,18 @@ def train(cfg: TrainConfig):
                     _bnd_extra += f"  rf_scale={val['val_refine_scale']:.4f}"
                 else:
                     _bnd_extra += f"  α_bnd={val['val_avg_boundary_alpha']:.3f}"
+            _retr_val_str = ""
+            if isinstance(model, ReprRegionRetrievalLM) and val.get("val_retrieval_loss", 0.0) > 0:
+                _retr_val_str = (
+                    f"  val_retr={val['val_retrieval_loss']:.4f}"
+                    f"  val_r@1={val['val_retrieval_acc1']:.3f}"
+                )
             print(
                 f"  [val] val_lm={val['val_lm_loss']:.4f}  ppl={val['val_ppl']:.2f}"
                 f"  coarse_acc@1={val['val_coarse_acc1']:.3f}"
                 f"  leaf_acc@8={val['val_leaf_acc8']:.3f}"
                 f"  α={val['current_alpha']:.3f}"
-                + _bnd_extra
+                + _bnd_extra + _retr_val_str
             )
             if hasattr(model, "_last_norms") and model._last_norms:
                 n = model._last_norms
@@ -4380,6 +4587,20 @@ def _parse_args() -> TrainConfig:
                    help="Trained repr_region checkpoint for boundary_analysis mode")
     p.add_argument("--max_analysis_batches", type=int, default=200,
                    help="Max val batches for boundary_analysis (0 = all)")
+    # repr_region_retrieval
+    p.add_argument("--retrieval_loss_type",  default="proxy", choices=["proxy", "supcon"],
+                   help="Retrieval metric loss: 'proxy' (CE over centroids) or 'supcon'")
+    p.add_argument("--lambda_retrieval",     type=float, default=0.0,
+                   help="Weight on retrieval metric loss (0 = disabled)")
+    p.add_argument("--retrieval_dim",        type=int,   default=128,
+                   help="Projection head output dimension for retrieval loss")
+    p.add_argument("--retrieval_temp",       type=float, default=0.07,
+                   help="Temperature for proxy/supcon retrieval loss")
+    p.add_argument("--retrieval_key_source", default="pre_region",
+                   choices=["pre_region", "post_region"],
+                   help="Hidden state to project: before (pre) or after (post) region injection")
+    p.add_argument("--max_retrieval_positions_per_batch", type=int, default=2048,
+                   help="Max positions subsampled per batch for supcon stability")
     a = p.parse_args()
     return TrainConfig(
         dataset=a.dataset, seq_len=a.seq_len, batch_size=a.batch_size,
@@ -4439,6 +4660,12 @@ def _parse_args() -> TrainConfig:
         boundary_mode=a.boundary_mode,
         repr_ckpt=a.repr_ckpt,
         max_analysis_batches=a.max_analysis_batches,
+        retrieval_loss_type=a.retrieval_loss_type,
+        lambda_retrieval=a.lambda_retrieval,
+        retrieval_dim=a.retrieval_dim,
+        retrieval_temp=a.retrieval_temp,
+        retrieval_key_source=a.retrieval_key_source,
+        max_retrieval_positions_per_batch=a.max_retrieval_positions_per_batch,
     )
 
 
