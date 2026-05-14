@@ -458,8 +458,31 @@ def load_gpt2xl_backbone_and_probe(
 
 # ── Hidden state extraction ───────────────────────────────────────────────────
 
+def validate_input_ids(src: torch.Tensor, vocab_size: int, max_ctx: int,
+                       where: str = "") -> None:
+    """CPU-side check before any CUDA embedding lookup."""
+    if src.dim() != 2:
+        raise ValueError(f"{where}: expected (B,T) tensor, got shape {list(src.shape)}")
+    T  = src.size(1)
+    mn = int(src.min().item())
+    mx = int(src.max().item())
+    if T > max_ctx:
+        raise ValueError(
+            f"{where}: sequence length T={T} exceeds position embedding "
+            f"max_ctx={max_ctx}. Reduce --seq_len or crop before calling."
+        )
+    if mn < 0 or mx >= vocab_size:
+        raise ValueError(
+            f"{where}: token id out of range min={mn} max={mx} "
+            f"vocab_size={vocab_size}"
+        )
+
+
 def get_hs_small(backbone, src: torch.Tensor, device: torch.device) -> torch.Tensor:
     """Returns (B, T, d_model) float32."""
+    vocab_size = backbone.token_emb.num_embeddings
+    max_ctx    = backbone.pos_emb.num_embeddings
+    validate_input_ids(src.cpu(), vocab_size, max_ctx, "get_hs_small")
     T   = src.shape[1]
     pos = torch.arange(T, device=device).unsqueeze(0)
     with torch.no_grad():
@@ -560,6 +583,10 @@ def build_or_load_memory(
 
         batch = batch.to(device)
         src   = batch[:, :-1]   # (B, T)
+
+        if bi == 0:
+            print(f"  [debug] memory batch 0: src shape={list(src.shape)}  "
+                  f"min_token={int(src.min())}  max_token={int(src.max())}")
         tgt   = batch[:, 1:]    # (B, T)  — aligned: key[:, t, :] predicts tgt[:, t]
 
         _, key    = get_key_fn(src)                  # (B, T, key_dim) float32
@@ -1313,10 +1340,20 @@ def main() -> None:
         from transformers import AutoTokenizer as _AT
         tok = _AT.from_pretrained(args.model_name,
                                   cache_dir=args.hf_cache_dir or None)
+        max_ctx = gpt2_model.config.n_positions
     else:
         from transformers import GPT2TokenizerFast
         tok = GPT2TokenizerFast.from_pretrained("gpt2")
         tok.model_max_length = int(1e30)
+        max_ctx = backbone.pos_emb.num_embeddings
+
+    # Clamp seq_len to model context window.
+    # args.seq_len may be 512 while the small model was trained with seq_len=256.
+    safe_seq_len = min(args.seq_len, max_ctx)
+    if safe_seq_len != args.seq_len:
+        print(f"[region_knn] WARNING: --seq_len {args.seq_len} > model max_ctx {max_ctx}; "
+              f"clamping to {safe_seq_len}")
+    print(f"[region_knn] vocab_size={vocab_size}  max_ctx={max_ctx}  seq_len={safe_seq_len}")
 
     print("[region_knn] encoding training split ...")
     train_tokens = load_wikitext(args.dataset, tok, "train")
@@ -1325,12 +1362,12 @@ def main() -> None:
     val_tokens = load_wikitext(args.dataset, tok, "validation")
     print(f"[region_knn] val: {len(val_tokens):,} tokens")
 
-    positions_per_batch = args.batch_size * args.seq_len
+    positions_per_batch = args.batch_size * safe_seq_len
     max_mem_batches  = math.ceil(args.max_memory_positions / positions_per_batch)
     max_eval_batches = math.ceil(args.max_eval_positions   / positions_per_batch)
 
-    train_ds = TokenChunkDataset(train_tokens, args.seq_len)
-    val_ds   = TokenChunkDataset(val_tokens,   args.seq_len)
+    train_ds = TokenChunkDataset(train_tokens, safe_seq_len)
+    val_ds   = TokenChunkDataset(val_tokens,   safe_seq_len)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=0,
                               pin_memory=(device.type == "cuda"), drop_last=True)
@@ -1364,7 +1401,8 @@ def main() -> None:
     if p_router is not None:
         dists["router"] = p_router
         top2r     = torch.topk(p_router, 2, dim=-1).values
-        r_margin  = top2r[:, 0] - top2r[:, 1]              # (N,)
+        r_margin  = top2r[:, 0] - top2r[:, 1]                            # (N,)
+        r_entropy = (-(p_router * (p_router + 1e-10).log()).sum(-1))      # (N,)
         mixes     = compute_all_mixtures(p_router, p_mem_w, r_margin,
                                           torch.topk(p_mem_w, 2, dim=-1).values[:,0]
                                           - torch.topk(p_mem_w, 2, dim=-1).values[:,1])
@@ -1476,6 +1514,60 @@ def main() -> None:
         mem_conf_cal = {"n_high_conf": n_hc,
                         "mem_top1_acc_when_high_conf": hc_correct,
                         "pct_high_conf": n_hc / n_eval}
+
+    # ── Save per-position distributions for offline controller eval ──────────
+    _K_SAVE = 32
+    _pp_path = os.path.join(args.output_dir, "per_position.npz")
+    try:
+        _kk = min(_K_SAVE, n_coarse)
+        _m_topk  = torch.topk(p_mem_w, _kk, dim=-1)
+        _mem_top_reg  = _m_topk.indices.cpu().numpy().astype(np.int16)
+        _mem_top_prob = _m_topk.values.cpu().numpy().astype(np.float16)
+        _mem_gold_prob = p_mem_w[torch.arange(n_eval), gold_all]
+        _mem_gold_rank = (p_mem_w > _mem_gold_prob.unsqueeze(-1)).sum(-1).cpu().numpy().astype(np.int16)
+
+        # Split encoding: 0=core, 1=medium, 2=boundary, 3=tight_boundary
+        _r_mg_np = r_margin.cpu().numpy()
+        _split_arr = np.zeros(n_eval, dtype=np.uint8)
+        _split_arr[_r_mg_np < 0.30] = 1
+        _split_arr[_r_mg_np < 0.10] = 2
+        _split_arr[_r_mg_np < 0.03] = 3
+
+        # Type encoding: 0=other, 1=A, 2=B, 3=C
+        _type_arr = np.zeros(n_eval, dtype=np.uint8)
+        if n_bnd > 0 and p_router is not None:
+            _bnd_np = bnd_idx.cpu().numpy()
+            _type_arr[_bnd_np[type_A_mask.cpu().numpy()]] = 1
+            _type_arr[_bnd_np[type_B_mask.cpu().numpy()]] = 2
+            _type_arr[_bnd_np[type_C_mask.cpu().numpy()]] = 3
+
+        _pp_kw: Dict = {
+            "gold_region":      gold_all.cpu().numpy().astype(np.int16),
+            "split":            _split_arr,
+            "type":             _type_arr,
+            "mem_topk_regions": _mem_top_reg,
+            "mem_topk_probs":   _mem_top_prob,
+            "mem_margin":       m_margin.cpu().numpy().astype(np.float16),
+            "mem_entropy":      m_entropy.cpu().numpy().astype(np.float16),
+            "mem_gold_rank":    _mem_gold_rank,
+        }
+        if p_router is not None:
+            _r_topk  = torch.topk(p_router, _kk, dim=-1)
+            _rtr_top_reg  = _r_topk.indices.cpu().numpy().astype(np.int16)
+            _rtr_top_prob = _r_topk.values.cpu().numpy().astype(np.float16)
+            _rtr_gold_prob = p_router[torch.arange(n_eval), gold_all]
+            _rtr_gold_rank = (p_router > _rtr_gold_prob.unsqueeze(-1)).sum(-1).cpu().numpy().astype(np.int16)
+            _pp_kw.update({
+                "router_topk_regions": _rtr_top_reg,
+                "router_topk_probs":   _rtr_top_prob,
+                "router_margin":       r_margin.cpu().numpy().astype(np.float16),
+                "router_entropy":      r_entropy.cpu().numpy().astype(np.float16),
+                "router_gold_rank":    _rtr_gold_rank,
+            })
+        np.savez_compressed(_pp_path, **_pp_kw)
+        print(f"[region_knn] saved per_position.npz  n={n_eval:,}  K={_kk}")
+    except Exception as _e:
+        print(f"[WARNING] could not save per_position.npz: {_e}")
 
     # ── Candidate coverage ────────────────────────────────────────────────────
     cov_rows: List[Dict] = []
