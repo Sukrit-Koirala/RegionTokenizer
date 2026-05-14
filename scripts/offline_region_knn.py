@@ -299,7 +299,7 @@ def compute_all_mixtures(p_r: torch.Tensor, p_m: torch.Tensor,
                          r_margin: torch.Tensor, m_margin: torch.Tensor
                          ) -> Dict[str, torch.Tensor]:
     mixes = {}
-    for b in [0.25, 0.50, 0.75]:
+    for b in [0.10, 0.25, 0.50, 0.75]:
         mixes[f"mix_{b:.2f}"] = mix(p_r, p_m, b)
     b_mg = beta_margin(r_margin)
     mixes["mix_margin"] = normalize_dist((1 - b_mg) * p_r + b_mg * p_m)
@@ -735,55 +735,138 @@ def union_coverage(p1: torch.Tensor, k1: int, p2: torch.Tensor, k2: int,
     }
 
 
-def adaptive_coverage(p_r: torch.Tensor, p_m: torch.Tensor,
-                       gold: torch.Tensor, tpr: torch.Tensor,
-                       r_margin: torch.Tensor, m_margin: torch.Tensor) -> Dict:
-    """Adaptive policy: route by router confidence + memory confidence."""
-    N      = len(gold)
-    case1  = r_margin >= 0.30                              # router top-1
-    case2  = (r_margin >= 0.10) & ~case1                   # router top-4
-    case3a = (r_margin < 0.10)  & (m_margin >= 0.20)       # union(router4, mem2)
-    case3b = (r_margin < 0.10)  & (m_margin < 0.20)        # router top-16
+def _adaptive_coverage_generic(
+    p_r: torch.Tensor, p_m: torch.Tensor,
+    gold: torch.Tensor, tpr: torch.Tensor,
+    cases: List[Tuple],   # (mask, router_k, mem_k)  first-match wins
+) -> Dict:
+    """
+    Generic adaptive coverage engine.
+    cases: list of (bool_mask, router_k, mem_k) in priority order.
+           router_k=0 → don't pull from router; mem_k=0 → don't pull from memory.
+    Last case is used as catch-all fallback for unmatched positions.
+    """
+    N  = len(gold)
+    nc = p_r.shape[-1]
 
-    rt1  = torch.topk(p_r, 1,  dim=-1).indices
-    rt4  = torch.topk(p_r, min(4, p_r.shape[-1]),  dim=-1).indices
-    rt16 = torch.topk(p_r, min(16, p_r.shape[-1]), dim=-1).indices
-    mt2  = torch.topk(p_m, min(2, p_m.shape[-1]),  dim=-1).indices
+    # Assign each position to the first matching case (reverse fill)
+    assigned = torch.full((N,), len(cases) - 1, dtype=torch.long)
+    for ci in range(len(cases) - 2, -1, -1):
+        mask = cases[ci][0]
+        assigned[mask] = ci
 
-    gold_c = gold.unsqueeze(-1)
-    cov = (
-        (case1 & (rt1  == gold_c).any(-1)) |
-        (case2 & (rt4  == gold_c).any(-1)) |
-        (case3a & ((rt4 == gold_c).any(-1) | (mt2 == gold_c).any(-1))) |
-        (case3b & (rt16 == gold_c).any(-1))
-    ).float().mean().item()
+    gold_c  = gold.unsqueeze(-1)
+    cov_arr = torch.zeros(N, dtype=torch.bool)
 
-    # Token counts (sampled)
+    for ci, (_, r_k, m_k) in enumerate(cases):
+        sel = assigned == ci
+        if not sel.any():
+            continue
+        contrib = torch.zeros(int(sel.sum()), dtype=torch.bool)
+        if r_k > 0:
+            rt = torch.topk(p_r[sel], min(r_k, nc), dim=-1).indices
+            contrib |= (rt == gold_c[sel]).any(-1)
+        if m_k > 0:
+            mt = torch.topk(p_m[sel], min(m_k, nc), dim=-1).indices
+            contrib |= (mt == gold_c[sel]).any(-1)
+        cov_arr[sel] = contrib
+
+    cov = cov_arr.float().mean().item()
+
     N_samp = min(N, 5000)
     reg_counts: List[float] = []
     tok_counts: List[float] = []
     for j in range(N_samp):
-        if case1[j]:
-            regs = set(rt1[j].tolist())
-        elif case2[j]:
-            regs = set(rt4[j].tolist())
-        elif case3a[j]:
-            regs = set(rt4[j].tolist()) | set(mt2[j].tolist())
-        else:
-            regs = set(rt16[j].tolist())
+        ci = int(assigned[j].item())
+        _, r_k, m_k = cases[ci]
+        regs: set = set()
+        if r_k > 0:
+            regs |= set(torch.topk(p_r[j], min(r_k, nc)).indices.tolist())
+        if m_k > 0:
+            regs |= set(torch.topk(p_m[j], min(m_k, nc)).indices.tolist())
         reg_counts.append(len(regs))
-        tok_counts.append(sum(tpr[r].item() for r in regs))
+        tok_counts.append(float(sum(tpr[r].item() for r in regs)))
+
+    fallback_rate = (assigned == len(cases) - 1).float().mean().item()
 
     return {
         "gold_region_coverage": cov,
         "avg_regions_kept":     float(np.mean(reg_counts)),
         "avg_tokens_kept":      float(np.mean(tok_counts)),
         "pct_vocab_kept":       float(np.mean(tok_counts)) / 50257 * 100,
-        "fallback_rate":        case3b.float().mean().item(),
-        "boundary_coverage":    cov,   # same as overall for boundary subset
-        "core_coverage":        (case1 & (rt1 == gold_c).any(-1)).float().sum().item()
-                                / case1.float().sum().clamp(min=1).item(),
+        "fallback_rate":        fallback_rate,
     }
+
+
+def adaptive_coverage(p_r, p_m, gold, tpr, r_margin, m_margin,
+                      m_entropy=None) -> Dict:
+    """v1 (original): router 1/4 → union(router4,mem2)|router16."""
+    N = len(r_margin)
+    fb = torch.ones(N, dtype=torch.bool)
+    cases = [
+        (r_margin >= 0.30,                                    1,  0),
+        (r_margin >= 0.10,                                    4,  0),
+        ((r_margin < 0.10) & (m_margin >= 0.20),              4,  2),
+        (fb,                                                 16,  0),
+    ]
+    return _adaptive_coverage_generic(p_r, p_m, gold, tpr, cases)
+
+
+def adaptive_v2_coverage(p_r, p_m, gold, tpr, r_margin, m_margin,
+                         m_entropy=None) -> Dict:
+    """v2 safer: router 4/8 → union(router8,mem4)|router16."""
+    N = len(r_margin)
+    fb = torch.ones(N, dtype=torch.bool)
+    cases = [
+        (r_margin >= 0.30,                                    4,  0),
+        (r_margin >= 0.10,                                    8,  0),
+        ((r_margin < 0.10) & (m_margin >= 0.20),              8,  4),
+        (fb,                                                 16,  0),
+    ]
+    return _adaptive_coverage_generic(p_r, p_m, gold, tpr, cases)
+
+
+def adaptive_v3_coverage(p_r, p_m, gold, tpr, r_margin, m_margin,
+                         m_entropy=None) -> Dict:
+    """v3 high coverage: router 4/12 → union(router12,mem4)|router24."""
+    N = len(r_margin)
+    fb = torch.ones(N, dtype=torch.bool)
+    cases = [
+        (r_margin >= 0.30,                                    4,  0),
+        (r_margin >= 0.10,                                   12,  0),
+        ((r_margin < 0.10) & (m_margin >= 0.20),             12,  4),
+        (fb,                                                 24,  0),
+    ]
+    return _adaptive_coverage_generic(p_r, p_m, gold, tpr, cases)
+
+
+def adaptive_v4_coverage(p_r, p_m, gold, tpr, r_margin, m_margin,
+                         m_entropy=None) -> Dict:
+    """v4 memory expansion only: always union at boundary (no confidence gate)."""
+    N = len(r_margin)
+    fb = torch.ones(N, dtype=torch.bool)
+    cases = [
+        (r_margin >= 0.30,    4,  0),
+        (r_margin >= 0.10,    8,  0),
+        (fb,                 16,  4),
+    ]
+    return _adaptive_coverage_generic(p_r, p_m, gold, tpr, cases)
+
+
+def adaptive_v5_coverage(p_r, p_m, gold, tpr, r_margin, m_margin,
+                         m_entropy=None) -> Dict:
+    """v5 confidence-gated: 3-way boundary split using mem margin + entropy."""
+    N  = len(r_margin)
+    me = m_entropy if m_entropy is not None else torch.zeros(N)
+    fb = torch.ones(N, dtype=torch.bool)
+    cases = [
+        (r_margin >= 0.30,                                                   4,  0),
+        (r_margin >= 0.10,                                                   8,  0),
+        ((r_margin < 0.10) & (m_margin > 0.25) & (me < 1.5),               8,  4),
+        ((r_margin < 0.10) & (m_margin > 0.15),                            12,  4),
+        (fb,                                                                24,  0),
+    ]
+    return _adaptive_coverage_generic(p_r, p_m, gold, tpr, cases)
 
 
 # ── Plots ─────────────────────────────────────────────────────────────────────
@@ -1051,6 +1134,8 @@ def write_summary(path: str, args, cfg_summary: Dict,
         "- `region_consistency_types.csv` — Type A/B/C analysis",
         "- `candidate_coverage.csv` — coverage per selection policy",
         "- `knn_config.json` — run configuration",
+        "- `type_analysis.csv` — per-type A/B/C detailed metrics",
+        "- `mem_conf_calibration.json` — memory confidence calibration stats",
         "- `plots/01-07` — diagnostic plots",
     ]
 
@@ -1288,8 +1373,10 @@ def main() -> None:
         r_margin = torch.zeros(n_eval)
         print("[region_knn] no probe loaded — router and mixture metrics skipped")
 
-    top2m   = torch.topk(p_mem_w, 2, dim=-1).values
-    m_margin = top2m[:, 0] - top2m[:, 1]   # (N,)
+    top2m    = torch.topk(p_mem_w, 2, dim=-1).values
+    m_margin = top2m[:, 0] - top2m[:, 1]                              # (N,)
+    m_entropy = (-(p_mem_w * (p_mem_w + 1e-10).log()).sum(-1))        # (N,)
+    total_mapped = int(tpr.sum().item())
 
     # ── Overall metrics ───────────────────────────────────────────────────────
     print("[region_knn] computing metrics ...")
@@ -1319,33 +1406,59 @@ def main() -> None:
     scatter_r_mg: List[float] = []
     scatter_m_mg: List[float] = []
     scatter_types: List[str]  = []
+    type_detail_rows: List[Dict] = []
 
     if n_bnd > 0 and p_router is not None:
-        bnd_idx    = bnd_mask.nonzero(as_tuple=True)[0]
-        # Sample for scatter (max 20K)
-        samp_idx   = bnd_idx[:20000]
-        s_rmg      = r_margin[samp_idx]
-        s_mmg      = m_margin[samp_idx]
-        s_gold     = gold_all[samp_idx]
-        mem_top4   = torch.topk(p_mem_w[samp_idx], min(4, n_coarse), dim=-1).indices
-        gold_in_mt = (mem_top4 == s_gold.unsqueeze(-1)).any(-1)  # in top-4 of memory
+        bnd_idx  = bnd_mask.nonzero(as_tuple=True)[0]
+        bnd_rmg  = r_margin[bnd_idx]
+        bnd_mmg  = m_margin[bnd_idx]
+        bnd_gold = gold_all[bnd_idx]
+        bnd_pmw  = p_mem_w[bnd_idx]
+        bnd_pr   = p_router[bnd_idx]
 
-        for i in range(len(samp_idx)):
-            rmg = s_rmg[i].item()
-            mmg = s_mmg[i].item()
-            in_top = gold_in_mt[i].item()
-            scatter_r_mg.append(rmg)
-            scatter_m_mg.append(mmg)
-            if mmg >= 0.20 and in_top:
-                tp = "A"
-                ta += 1
-            elif mmg >= 0.20 and not in_top:
-                tp = "C"
-                tc += 1
-            else:
-                tp = "B"
-                tb += 1
-            scatter_types.append(tp)
+        # Vectorised classification
+        mem_top4    = torch.topk(bnd_pmw, min(4, n_coarse), dim=-1).indices
+        gold_in_mt4 = (mem_top4 == bnd_gold.unsqueeze(-1)).any(-1)
+        type_A_mask = (bnd_mmg >= 0.20) & gold_in_mt4
+        type_C_mask = (bnd_mmg >= 0.20) & ~gold_in_mt4
+        type_B_mask = ~type_A_mask & ~type_C_mask
+        ta = int(type_A_mask.sum().item())
+        tb = int(type_B_mask.sum().item())
+        tc = int(type_C_mask.sum().item())
+
+        # Per-type detailed metrics
+        bnd_mix50 = dists.get("mix_0.50")
+        for tp_name, tp_mask in [("A", type_A_mask), ("B", type_B_mask), ("C", type_C_mask)]:
+            n_tp = int(tp_mask.sum())
+            if n_tp == 0:
+                continue
+            g_tp = bnd_gold[tp_mask]
+            pr_m = compute_metrics(bnd_pr[tp_mask], g_tp, n_coarse)
+            pm_m = compute_metrics(bnd_pmw[tp_mask], g_tp, n_coarse)
+            row: Dict = {
+                "type": tp_name, "count": n_tp,
+                "pct_of_boundary": n_tp / max(n_bnd, 1),
+                "router_acc1": pr_m["acc1"],   "router_acc4": pr_m["acc4"],
+                "router_nll":  pr_m["region_nll"],
+                "mem_acc1":    pm_m["acc1"],   "mem_acc4": pm_m["acc4"],
+                "mem_nll":     pm_m["region_nll"],
+            }
+            if bnd_mix50 is not None:
+                mx_m = compute_metrics(bnd_mix50[bnd_idx][tp_mask], g_tp, n_coarse)
+                row.update({"mix50_acc1": mx_m["acc1"], "mix50_nll": mx_m["region_nll"]})
+                row["improvement_vs_router"] = pr_m["region_nll"] - mx_m["region_nll"]
+            type_detail_rows.append(row)
+
+        # Q5 check: Type A improvement > Type B improvement + 0.02
+        _imp = {r["type"]: r.get("improvement_vs_router", 0.0) for r in type_detail_rows}
+
+        # Scatter sample (≤10k) for plot
+        samp_n = min(n_bnd, 10000)
+        samp_local = torch.randperm(n_bnd)[:samp_n]
+        scatter_r_mg   = bnd_rmg[samp_local].tolist()
+        scatter_m_mg   = bnd_mmg[samp_local].tolist()
+        scatter_types  = ["A" if type_A_mask[i] else ("C" if type_C_mask[i] else "B")
+                          for i in samp_local.tolist()]
 
     consistency_counts = {
         "type_A": ta, "type_B": tb, "type_C": tc,
@@ -1353,30 +1466,68 @@ def main() -> None:
         "non_boundary": n_eval - n_bnd,
     }
 
+    # Memory confidence calibration: among high-confidence memory positions, frac correct
+    mem_conf_cal: Dict = {}
+    high_conf = m_margin > 0.25
+    n_hc = int(high_conf.sum())
+    if n_hc > 0:
+        mem_top1 = p_mem_w.argmax(-1)
+        hc_correct = (mem_top1[high_conf] == gold_all[high_conf]).float().mean().item()
+        mem_conf_cal = {"n_high_conf": n_hc,
+                        "mem_top1_acc_when_high_conf": hc_correct,
+                        "pct_high_conf": n_hc / n_eval}
+
     # ── Candidate coverage ────────────────────────────────────────────────────
     cov_rows: List[Dict] = []
 
     def _add(policy, **kwargs):
-        cov_rows.append({"policy": policy, **kwargs})
+        row = {"policy": policy, **kwargs}
+        # Mapped-vocab percent (tokens kept as % of mapped tokens, not full vocab)
+        if "avg_tokens_kept" in row and total_mapped > 0:
+            row["mapped_vocab_percent"] = row["avg_tokens_kept"] / total_mapped * 100
+        cov_rows.append(row)
 
     if p_router is not None:
-        for k in [1, 4, 8, 16]:
+        for k in [1, 2, 4, 8, 12, 16, 24, 32]:
             c = topk_coverage(p_router, gold_all, k, tpr)
             _add(f"router_top{k}", **c)
-    for k in [1, 4, 8, 16]:
+    for k in [1, 2, 4, 8, 16]:
         c = topk_coverage(p_mem_w, gold_all, k, tpr)
         _add(f"mem_top{k}", **c)
-    if "mix_0.50" in dists:
-        for k in [1, 4, 8, 16]:
-            c = topk_coverage(dists["mix_0.50"], gold_all, k, tpr)
-            _add(f"mix50_top{k}", **c)
+
+    # Mix policies — use best mix distribution
+    best_mix_key = "mix_0.50"
+    for mk in ["mix_0.25", "mix_0.50", "mix_0.75"]:
+        if mk in dists:
+            best_mix_key = mk
+    if best_mix_key in dists:
+        for k in [1, 2, 4, 8, 16]:
+            c = topk_coverage(dists[best_mix_key], gold_all, k, tpr)
+            _add(f"mix_top{k}", **c)
+
     if p_router is not None:
-        for k1, k2 in [(4, 4), (8, 8)]:
+        # Union policies
+        for k1, k2 in [(4, 2), (4, 4), (8, 2), (8, 4), (8, 8),
+                       (12, 4), (16, 4), (16, 8), (16, 16)]:
             c = union_coverage(p_router, k1, p_mem_w, k2, gold_all, tpr)
             _add(f"union_r{k1}_m{k2}", **c)
-        c_adp = adaptive_coverage(p_router, p_mem_w, gold_all, tpr,
-                                   r_margin, m_margin)
-        _add("adaptive", **c_adp)
+
+        # Adaptive policies v1–v5
+        for vname, fn in [
+            ("adaptive_v1", adaptive_coverage),
+            ("adaptive_v2", adaptive_v2_coverage),
+            ("adaptive_v3", adaptive_v3_coverage),
+            ("adaptive_v4", adaptive_v4_coverage),
+            ("adaptive_v5", adaptive_v5_coverage),
+        ]:
+            try:
+                c = fn(p_router, p_mem_w, gold_all, tpr, r_margin, m_margin, m_entropy)
+                _add(vname, **c)
+            except Exception as e:
+                print(f"[WARNING] {vname} failed: {e}")
+
+    # Keep a reference to v1 result for downstream verdicts
+    adp = next((r for r in cov_rows if r["policy"] == "adaptive_v1"), {})
 
     # ── Verdicts ──────────────────────────────────────────────────────────────
     def _v(cond: bool) -> str:
@@ -1397,15 +1548,20 @@ def main() -> None:
     best_single = min(r_bnd.get("region_nll", 1e9), m_bnd.get("region_nll", 1e9))
     q2 = _v(x50_bnd.get("region_nll", 1e9) < best_single - 0.005)
 
-    # Q3: Type A improves more than Type B (check metrics if we have per-type)
-    q3 = _v(ta > tb)   # proxy: if more Type A than B, memory is region-consistent
+    # Q3: Type A improves more than Type B by at least 0.02 NLL
+    _imp = {r["type"]: r.get("improvement_vs_router", 0.0) for r in type_detail_rows}
+    q3 = _v(_imp.get("A", 0.0) > _imp.get("B", 0.0) + 0.02)
 
-    # Q4: Adaptive policy maintains high coverage
-    adp = next((r for r in cov_rows if r["policy"] == "adaptive"), {})
-    q4 = _v(adp.get("gold_region_coverage", 0) >= 0.90)
+    # Q4: Best adaptive policy maintains ≥90% gold-region coverage
+    best_adp = max(
+        (r for r in cov_rows if r["policy"].startswith("adaptive")),
+        key=lambda r: r.get("gold_region_coverage", 0.0),
+        default={},
+    )
+    q4 = _v(best_adp.get("gold_region_coverage", 0) >= 0.90)
 
-    # Q5: Adaptive policy reduces vocab size significantly
-    q5 = _v(adp.get("pct_vocab_kept", 100) < 20.0)
+    # Q5: Best adaptive policy keeps < 20% of vocab as candidate tokens
+    q5 = _v(best_adp.get("pct_vocab_kept", 100) < 20.0)
 
     # Q6: Memory misleading rate acceptable (Type C ≤ 20% of boundary)
     c_rate = tc / max(ta + tb + tc, 1)
@@ -1450,6 +1606,15 @@ def main() -> None:
 
     # candidate_coverage.csv
     _csv(cov_rows, "candidate_coverage.csv")
+
+    # type_analysis.csv
+    if type_detail_rows:
+        _csv(type_detail_rows, "type_analysis.csv")
+
+    # mem_conf_calibration.json
+    if mem_conf_cal:
+        with open(os.path.join(args.output_dir, "mem_conf_calibration.json"), "w") as f:
+            json.dump(mem_conf_cal, f, indent=2)
 
     # knn_config.json
     cfg_json = {
@@ -1505,11 +1670,12 @@ def main() -> None:
                 print(f"    {mname:<16}  acc@1={d['acc1']:.3f}  "
                       f"acc@4={d['acc4']:.3f}  nll={d['region_nll']:.3f}  "
                       f"rank={d['gold_rank_mean']:.1f}")
-    if adp:
-        print(f"\n  Adaptive policy:  coverage={adp['gold_region_coverage']:.3f}  "
-              f"avg_regions={adp['avg_regions_kept']:.1f}  "
-              f"avg_tokens={adp['avg_tokens_kept']:.0f}  "
-              f"vocab%={adp['pct_vocab_kept']:.1f}%")
+    if best_adp:
+        print(f"\n  Best adaptive ({best_adp.get('policy','?')}):  "
+              f"coverage={best_adp['gold_region_coverage']:.3f}  "
+              f"avg_regions={best_adp['avg_regions_kept']:.1f}  "
+              f"avg_tokens={best_adp['avg_tokens_kept']:.0f}  "
+              f"vocab%={best_adp['pct_vocab_kept']:.1f}%")
 
 
 if __name__ == "__main__":
