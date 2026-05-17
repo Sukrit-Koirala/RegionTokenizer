@@ -388,30 +388,63 @@ def _aggregate_eval_stats(stats: Dict) -> Dict:
 
 
 @torch.no_grad()
-def eval_force_zero(val_dir: str, tok_emb_w: torch.Tensor,
-                    eval_batch_size: int, device) -> Tuple[Dict, str]:
+def canonical_eval_refiner(
+    model,
+    val_dir: str,
+    tok_emb_w: torch.Tensor,
+    r2s_np: np.ndarray,
+    device,
+    force_zero: bool = False,
+    eval_batch_size: int = 64,
+    max_eval_examples: Optional[int] = None,
+    official_baseline: Optional[Dict] = None,
+    fail_on_mismatch: bool = False,
+    variant_tag: str = "",
+    return_delta_stats: bool = False,
+) -> Dict:
     """
-    Architecture-independent force-zero baseline eval.
+    THE canonical evaluator — the only path for all refiner validation.
 
-    Loads shards directly (no model, no ShardStreamDataset, no r2s).
-    Computes:  scores[b,c] = h_prime[b] · tok_emb[cand_tok[b,c]]
-    Evaluates ALL examples — no max_batches cap.
-    Returns (metrics_dict, dataset_fingerprint).
+    Loads shards directly: no ShardStreamDataset, no shuffling, no max_batches cap.
+    Coverage, candidate mask, and gold index come from saved shard tensors ONLY.
+    The model may change scores; it must never change coverage, candidates, or mask.
+
+    force_zero=True:  scores = h_prime @ tok_emb[cand]  (no model call)
+    force_zero=False: model forward is called; model must not be None
+
+    When official_baseline (loaded JSON dict) is provided and max_eval_examples is None,
+    asserts fingerprint / num_examples / num_covered / coverage match the baseline.
+    If fail_on_mismatch=True, raises RuntimeError on any mismatch.
+
+    Returns a metrics dict including:
+      covered_nll, coverage, fallback_rate, num_examples, num_covered,
+      mean_cand_count, dataset_fingerprint, eval_mode,
+      cnll_<split>, cov_<split>, fallback_<split>
     """
     paths = sorted(glob.glob(os.path.join(val_dir, "shard_*.pt")))
     if not paths:
         raise RuntimeError(f"No shard_*.pt in {val_dir}")
+    if not force_zero and model is None:
+        raise RuntimeError("canonical_eval_refiner: model required when force_zero=False")
 
     emb_w = tok_emb_w.float().to(device)
-    stats: Dict = defaultdict(lambda: [0.0, 0, 0])
+    if model is not None:
+        model.eval()
 
-    total_n          = 0
-    total_cov        = 0
-    sum_cand_counts  = 0
-    sum_gold_idx_cov = 0
-    sum_gold_tok     = 0
+    stats: Dict          = defaultdict(lambda: [0.0, 0, 0])
+    total_n              = 0
+    total_cov            = 0
+    sum_cand_counts      = 0
+    sum_gold_idx_cov     = 0
+    sum_gold_tok         = 0
+    delta_abs_sum        = 0.0
+    delta_abs_max_val    = 0.0
+    delta_abs_n          = 0
+    done                 = False
 
     for path in paths:
+        if done:
+            break
         shard    = torch.load(path, map_location="cpu", weights_only=True)
         N        = len(shard["covered"])
         has_type = "type_arr" in shard
@@ -419,23 +452,55 @@ def eval_force_zero(val_dir: str, tok_emb_w: torch.Tensor,
         tp_all   = shard["type_arr"].long() if has_type else torch.zeros(N, dtype=torch.long)
         has_gtok = "gold_token" in shard
 
+        # Build cand_super for this shard once (needed for D3 model forward)
+        cf_np    = shard["cand_fine"].numpy().astype(np.int64).clip(min=0)
+        cs_np    = r2s_np[cf_np].astype(np.int64)
+        cs_np[shard["cand_fine"].numpy() < 0] = 0
+        cs_shard = torch.from_numpy(cs_np)   # (N, C)
+
         for start in range(0, N, eval_batch_size):
-            end     = min(start + eval_batch_size, N)
-            h       = shard["h_prime"][start:end].float().to(device)       # (B, d_model)
-            ct      = shard["cand_tok"][start:end].long().to(device)       # (B, C)
-            g_idx   = shard["gold_cand_idx"][start:end].long().to(device)  # (B,)
-            covered = shard["covered"][start:end].bool().to(device)        # (B,)
+            if max_eval_examples is not None and total_n >= max_eval_examples:
+                done = True
+                break
+
+            end = min(start + eval_batch_size, N)
+            if max_eval_examples is not None:
+                end = min(end, start + (max_eval_examples - total_n))
+
+            h       = shard["h_prime"][start:end].float().to(device)
+            ct      = shard["cand_tok"][start:end].long().to(device)
+            cf      = shard["cand_fine"][start:end].long().to(device)
+            cs      = cs_shard[start:end].long().to(device)
+            g_idx   = shard["gold_cand_idx"][start:end].long().to(device)
+            covered = shard["covered"][start:end].bool().to(device)
             sp      = sp_all[start:end]
             tp      = tp_all[start:end]
             B, C    = ct.shape
 
-            cmask  = (ct >= 0)
-            tok_e  = F.embedding(ct.clamp(min=0), emb_w)                  # (B, C, d_model)
-            scores = (h.unsqueeze(1) * tok_e).sum(-1)                      # (B, C)
-            scores = scores.masked_fill(~cmask, float("-inf"))
+            cmask    = (ct >= 0)
+            tok_e    = F.embedding(ct.clamp(min=0), emb_w)      # (B, C, d_model)
+            base_raw = (h.unsqueeze(1) * tok_e).sum(-1)          # (B, C)
 
-            cov      = covered
-            n_cov_b  = int(cov.sum())
+            if force_zero:
+                scores = base_raw.masked_fill(~cmask, float("-inf"))
+            else:
+                r_reg    = shard["router_topk_reg"][start:end].long().to(device)
+                r_prb    = shard["router_topk_prb"][start:end].float().to(device)
+                m_reg    = shard["mem_topk_reg"][start:end].long().to(device)
+                m_prb    = shard["mem_topk_prb"][start:end].float().to(device)
+                r_margin = shard["router_margin"][start:end].float().to(device)
+                m_margin = shard["mem_margin"][start:end].float().to(device)
+                scores, _ = model(h, ct, cf, cs, cmask, emb_w,
+                                  r_reg, r_prb, m_reg, m_prb, r_margin, m_margin)
+                if return_delta_stats and cmask.any():
+                    base_m = base_raw.masked_fill(~cmask, float("-inf"))
+                    dv = (scores - base_m)[cmask]
+                    delta_abs_sum     += float(dv.abs().sum())
+                    delta_abs_max_val  = max(delta_abs_max_val, float(dv.abs().max()))
+                    delta_abs_n       += int(cmask.sum())
+
+            cov     = covered
+            n_cov_b = int(cov.sum())
 
             if n_cov_b > 0:
                 lp      = F.log_softmax(scores[cov], dim=-1)
@@ -458,11 +523,18 @@ def eval_force_zero(val_dir: str, tok_emb_w: torch.Tensor,
             if has_gtok:
                 sum_gold_tok += int(shard["gold_token"][start:end].long().sum())
 
-    results = _aggregate_eval_stats(stats)
-    results["num_examples"]  = total_n
-    results["num_covered"]   = total_cov
-    results["mean_cand_count"] = sum_cand_counts / max(total_n, 1)
+    if model is not None:
+        model.train()
 
+    results = _aggregate_eval_stats(stats)
+    results["num_examples"]    = total_n
+    results["num_covered"]     = total_cov
+    results["mean_cand_count"] = sum_cand_counts / max(total_n, 1)
+    if return_delta_stats and delta_abs_n > 0:
+        results["delta_abs_mean"] = delta_abs_sum / delta_abs_n
+        results["delta_abs_max"]  = delta_abs_max_val
+
+    # Fingerprint — identical formula to eval_saved_candidate_baseline.py
     fp_data = {
         "num_shards":       len(paths),
         "total_n":          total_n,
@@ -476,39 +548,82 @@ def eval_force_zero(val_dir: str, tok_emb_w: torch.Tensor,
     ).hexdigest()[:16]
     results["dataset_fingerprint"] = fingerprint
 
-    return results, fingerprint
+    is_full = max_eval_examples is None
+    results["eval_mode"] = "canonical_full_val" if is_full else f"canonical_subset_{total_n}"
+
+    # Dataset consistency enforcement: fingerprint + counts + coverage (not NLL)
+    # NLL is expected to improve during training; only dataset identity is enforced.
+    if official_baseline is not None and is_full:
+        ref      = official_baseline
+        fp_ok    = fingerprint == ref.get("dataset_fingerprint", "")
+        n_ok     = total_n  == ref.get("num_examples", -1)
+        nc_ok    = total_cov == ref.get("num_covered",  -1)
+        cov_diff = abs(results["coverage"] - ref.get("coverage", -1.0))
+        cov_ok   = cov_diff < 1e-6
+        ok       = fp_ok and n_ok and nc_ok and cov_ok
+        if not ok:
+            issues = []
+            if not fp_ok:
+                issues.append(
+                    f"fingerprint {fingerprint!r} != {ref.get('dataset_fingerprint','?')!r}"
+                )
+            if not n_ok:
+                issues.append(f"num_examples {total_n} != {ref.get('num_examples','?')}")
+            if not nc_ok:
+                issues.append(f"num_covered {total_cov} != {ref.get('num_covered','?')}")
+            if not cov_ok:
+                issues.append(f"coverage diff {cov_diff:.2e}")
+            msg = (f"Canonical eval dataset MISMATCH [{variant_tag}]: "
+                   + ", ".join(issues)
+                   + ". The model must not change coverage, candidate set, or fingerprint.")
+            if fail_on_mismatch:
+                raise RuntimeError(msg)
+            print(f"  WARNING: {msg}")
+
+    return results
 
 
-def check_baseline_match(results: Dict, fingerprint: str,
-                         baseline_path: str, fail: bool,
-                         context: str = "") -> bool:
+def check_baseline_match(results: Dict, baseline: Dict, fail: bool,
+                         context: str = "", check_nll: bool = True) -> bool:
     """
-    Compare force-zero eval results against the official saved-candidate baseline.
+    Compare canonical eval results against the official saved-candidate baseline.
+
+    Always checks: fingerprint, num_examples, num_covered, coverage.
+    check_nll=True: also checks covered_nll (use for force-zero verification only;
+                    during training NLL is expected to be better than baseline).
     Returns True if PASS, raises RuntimeError if fail=True and check fails.
     """
-    with open(baseline_path) as f:
-        ref = json.load(f)
+    fingerprint = results.get("dataset_fingerprint", "")
+    nll_diff  = abs(results["covered_nll"] - baseline["covered_nll"])
+    cov_diff  = abs(results["coverage"]    - baseline["coverage"])
+    fp_match  = fingerprint == baseline.get("dataset_fingerprint", "")
+    n_match   = results.get("num_examples", -1) == baseline.get("num_examples", -2)
+    nc_match  = results.get("num_covered",  -1) == baseline.get("num_covered",  -2)
 
-    nll_diff  = abs(results["covered_nll"] - ref["covered_nll"])
-    cov_diff  = abs(results["coverage"]    - ref["coverage"])
-    fp_match  = fingerprint == ref.get("dataset_fingerprint", "")
-    ok        = nll_diff < 1e-4 and cov_diff < 1e-6 and fp_match
-    tag       = "PASS" if ok else "FAIL"
-    pfx       = f"[{context}] " if context else ""
+    nll_ok = nll_diff < 1e-4 if check_nll else True
+    ok     = fp_match and n_match and nc_match and cov_diff < 1e-6 and nll_ok
+    tag    = "PASS" if ok else "FAIL"
+    pfx    = f"[{context}] " if context else ""
 
     print(f"  {pfx}baseline check: {tag}")
-    print(f"    covered_nll : {results['covered_nll']:.6f}  "
-          f"(ref={ref['covered_nll']:.6f}  diff={nll_diff:.2e})")
-    print(f"    coverage    : {results['coverage']:.6f}  "
-          f"(ref={ref['coverage']:.6f}  diff={cov_diff:.2e})")
-    print(f"    fingerprint : {fingerprint}  "
-          f"(ref={ref.get('dataset_fingerprint','?')}  match={fp_match})")
+    if check_nll:
+        print(f"    covered_nll  : {results['covered_nll']:.6f}  "
+              f"(ref={baseline['covered_nll']:.6f}  diff={nll_diff:.2e})")
+    print(f"    coverage     : {results['coverage']:.6f}  "
+          f"(ref={baseline['coverage']:.6f}  diff={cov_diff:.2e})")
+    print(f"    fingerprint  : {fingerprint}  "
+          f"(ref={baseline.get('dataset_fingerprint','?')}  match={fp_match})")
+    print(f"    num_examples : {results.get('num_examples','?'):,}  "
+          f"(ref={baseline.get('num_examples','?'):,}  match={n_match})")
+    print(f"    num_covered  : {results.get('num_covered','?'):,}  "
+          f"(ref={baseline.get('num_covered','?'):,}  match={nc_match})")
 
     if not ok and fail:
         raise RuntimeError(
-            f"{pfx}Force-zero baseline MISMATCH. "
-            f"nll_diff={nll_diff:.2e}  cov_diff={cov_diff:.2e}  fp_match={fp_match}. "
-            f"Fix before training."
+            f"{pfx}Baseline MISMATCH. "
+            f"fp_match={fp_match}  n_match={n_match}  nc_match={nc_match}  "
+            f"cov_diff={cov_diff:.2e}  nll_diff={nll_diff:.2e}. "
+            f"Fix before proceeding."
         )
     return ok
 
@@ -752,46 +867,100 @@ def train_variant(args, backbone, d_model: int, n_fine: int, n_super: int,
     log_csv  = csv.DictWriter(log_file, fieldnames=log_fields, extrasaction="ignore")
     log_csv.writeheader()
 
+    # Load official baseline JSON once at startup
+    baseline_path = getattr(args, "official_baseline", None)
+    fail_hard     = getattr(args, "fail_on_baseline_mismatch", False)
+    official_bl: Optional[Dict] = None
+    if baseline_path and os.path.isfile(baseline_path):
+        with open(baseline_path) as _f:
+            official_bl = json.load(_f)
+        print()
+        print("=== CANONICAL EVAL ENABLED ===")
+        print(f"  official baseline  : {baseline_path}")
+        print(f"    nll              : {official_bl['covered_nll']:.6f}")
+        print(f"    coverage         : {official_bl['coverage']:.6f}")
+        print(f"    fingerprint      : {official_bl['dataset_fingerprint']}")
+        print(f"    num_examples     : {official_bl['num_examples']:,}")
+        print(f"    num_covered      : {official_bl['num_covered']:,}")
+        print("  All full-val evals will assert same fingerprint/coverage/counts.")
+        if fail_hard:
+            print("  --fail_on_baseline_mismatch: training will abort on any mismatch.")
+        print()
+    else:
+        print()
+        print("  WARNING: no --official_baseline provided. "
+              "Cannot enforce cross-variant consistency. "
+              "Run eval_saved_candidate_baseline.py first.")
+        print()
+
+    variant_tag = args.variant.upper()
+    if variant_tag == "D3":
+        variant_tag += f"-{args.d3_size}"
+
     best_nll   = float("inf")
+    best_step  = 0
     ema_ce     = None
     t0         = time.time()
     model.train()
 
     if getattr(args, "eval_before_train", False):
         print("[train] === step-0 eval (eval_before_train) ===")
-
-        # Architecture-independent force-zero: h_prime @ tok_emb[cand_tok], full dataset
         tok_emb_dev = model._tok_emb_w
-        m0_zero, fp = eval_force_zero(args.val_dir, tok_emb_dev,
-                                       args.eval_batch_size, device)
-        print(f"  [step 0 / force_zero] covered_nll={m0_zero['covered_nll']:.6f}  "
+
+        # Force-zero: full val, canonical path, no model call
+        print("  [step 0 / force_zero] full val ...")
+        m0_zero = canonical_eval_refiner(
+            None, args.val_dir, tok_emb_dev, r2s_np, device,
+            force_zero=True, eval_batch_size=args.eval_batch_size,
+            official_baseline=official_bl, fail_on_mismatch=fail_hard,
+            variant_tag=variant_tag,
+        )
+        fp = m0_zero["dataset_fingerprint"]
+        print(f"  [step 0 / force_zero]  covered_nll={m0_zero['covered_nll']:.6f}  "
               f"cov={m0_zero['coverage']:.6f}  fingerprint={fp}")
         print(f"    num_examples={m0_zero['num_examples']:,}  "
               f"num_covered={m0_zero['num_covered']:,}  "
               f"mean_cands={m0_zero['mean_cand_count']:.1f}")
+        if official_bl:
+            check_baseline_match(m0_zero, official_bl, fail_hard,
+                                 context=f"force_zero/{variant_tag}", check_nll=True)
 
-        # Baseline consistency check
-        baseline_path = getattr(args, "official_baseline", None)
-        fail_hard     = getattr(args, "fail_on_baseline_mismatch", False)
-        if baseline_path and os.path.isfile(baseline_path):
-            ok = check_baseline_match(m0_zero, fp, baseline_path, fail_hard,
-                                      context=f"variant={args.variant}")
-            if not ok:
-                print("  WARNING: force-zero baseline MISMATCH — results will not be "
-                      "comparable across variants until this is fixed.")
-        else:
-            print("  WARNING: no --official_baseline provided; cannot verify "
-                  "cross-variant consistency. Run eval_saved_candidate_baseline.py first.")
-
-        # Init identity check: residual_scale=0 → delta=0 → scores == force_zero
+        # Small-batch identity check (fast sanity: residual_scale=0 → delta=0)
         print()
-        print("  [init identity] verifying residual_scale=0 → delta=0 ...")
+        print("  [init identity] verifying residual_scale=0 → delta=0 (first batch) ...")
         check_init_identity(model, args.val_dir, tok_emb_dev, r2s_np, device,
                             print_delta_stats=getattr(args, "print_delta_stats", False))
 
-        # Log step-0 using force_zero metrics (full dataset, authoritative)
+        # With-delta: full val, canonical path, model called
+        print()
+        print("  [step 0 / with_delta] full val ...")
+        m0_with = canonical_eval_refiner(
+            model, args.val_dir, tok_emb_dev, r2s_np, device,
+            force_zero=False, eval_batch_size=args.eval_batch_size,
+            official_baseline=official_bl, fail_on_mismatch=fail_hard,
+            variant_tag=variant_tag,
+        )
+        print(f"  [step 0 / with_delta]  covered_nll={m0_with['covered_nll']:.6f}  "
+              f"cov={m0_with['coverage']:.6f}  fingerprint={m0_with['dataset_fingerprint']}")
+
+        # Hard assertion: step-0 with_delta must equal force_zero
+        nll_diff0 = abs(m0_with["covered_nll"] - m0_zero["covered_nll"])
+        fp_ok0    = m0_with["dataset_fingerprint"] == fp
+        cov_ok0   = abs(m0_with["coverage"] - m0_zero["coverage"]) < 1e-6
+        if nll_diff0 >= 1e-4 or not fp_ok0 or not cov_ok0:
+            raise RuntimeError(
+                f"Step-0 identity FAIL [{variant_tag}]: "
+                f"with_delta NLL={m0_with['covered_nll']:.6f}  "
+                f"force_zero NLL={m0_zero['covered_nll']:.6f}  "
+                f"nll_diff={nll_diff0:.2e}  fp_ok={fp_ok0}  cov_ok={cov_ok0}. "
+                f"Residual must be zero at init."
+            )
+        print(f"  [step 0] identity PASS: nll_diff={nll_diff0:.2e}  "
+              f"fingerprint match={fp_ok0}  coverage match={cov_ok0}")
+
+        # Log step-0 using with_delta metrics (equals force_zero at init)
         row0 = {"step": 0, "ce": float("nan"), "kl": float("nan"), "delta": float("nan"),
-                **m0_zero}
+                **m0_with}
         log_csv.writerow(row0)
         log_file.flush()
         model.train()
@@ -820,29 +989,62 @@ def train_variant(args, backbone, d_model: int, n_fine: int, n_super: int,
                   f"kl={info['kl']:.4f}  t={time.time()-t0:.0f}s")
 
         if step % args.eval_every == 0 or step == args.steps:
-            print(f"  [eval] step {step} ...")
-            metrics = eval_dataset(model, args.val_dir, r2s_np,
-                                   args.batch_size, device,
-                                   max_batches=args.eval_max_batches)
+            print(f"  [eval/canonical_full_val] step={step} ...")
+            metrics = canonical_eval_refiner(
+                model, args.val_dir, model._tok_emb_w, r2s_np, device,
+                force_zero=False, eval_batch_size=args.eval_batch_size,
+                official_baseline=official_bl, fail_on_mismatch=fail_hard,
+                variant_tag=variant_tag,
+            )
             row = {"step": step, **info, **metrics}
             log_csv.writerow(row)
             log_file.flush()
 
             nll = metrics["covered_nll"]
-            print(f"  [eval] step={step}  covered_nll={nll:.4f}  "
-                  f"cov={metrics['coverage']:.4f}  "
-                  f"fb={metrics['fallback_rate']:.4f}")
+            fp_now = metrics["dataset_fingerprint"]
+            bl_nll = official_bl["covered_nll"] if official_bl else float("nan")
+            delta_vs_bl = bl_nll - nll  # positive = improvement
+            print(f"  [eval/canonical_full_val] step={step}")
+            print(f"    eval_mode    = {metrics['eval_mode']}")
+            print(f"    covered_nll  = {nll:.6f}  "
+                  f"(baseline={bl_nll:.6f}  delta={delta_vs_bl:+.6f})")
+            print(f"    coverage     = {metrics['coverage']:.6f}")
+            print(f"    fingerprint  = {fp_now}")
+            print(f"    num_examples = {metrics['num_examples']:,}")
+            print(f"    num_covered  = {metrics['num_covered']:,}")
+            print(f"    mean_cands   = {metrics['mean_cand_count']:.1f}")
+            print(f"    fallback     = {metrics['fallback_rate']:.4f}")
 
             if nll < best_nll:
-                best_nll = nll
+                best_nll  = nll
+                best_step = step
+                best_metrics = {
+                    "eval_mode":             "canonical_full_val",
+                    "step":                  step,
+                    "official_baseline_nll": official_bl["covered_nll"] if official_bl else None,
+                    "covered_nll":           nll,
+                    "delta_vs_baseline":     delta_vs_bl,
+                    "coverage":              metrics["coverage"],
+                    "fingerprint":           fp_now,
+                    "num_examples":          metrics["num_examples"],
+                    "num_covered":           metrics["num_covered"],
+                    "mean_cand_count":       metrics["mean_cand_count"],
+                    "fallback_rate":         metrics["fallback_rate"],
+                    "variant":               variant_tag,
+                }
                 torch.save({"step": step, "model": model.state_dict(),
                             "metrics": metrics, "args": vars(args)}, best_path)
-                print(f"  [eval] new best  covered_nll={best_nll:.4f}  saved {best_path}")
+                best_json = os.path.join(args.output_dir, "best_metrics.json")
+                with open(best_json, "w") as _f:
+                    json.dump(best_metrics, _f, indent=2)
+                print(f"  [eval] new best  covered_nll={best_nll:.6f}  "
+                      f"delta_vs_baseline={delta_vs_bl:+.6f}  saved {best_path}")
 
     torch.save({"step": args.steps, "model": model.state_dict(),
                 "metrics": {}, "args": vars(args)}, last_path)
     log_file.close()
-    print(f"\n[train] done  best_covered_nll={best_nll:.4f}  ckpt={best_path}")
+    print(f"\n[train] done  variant={variant_tag}  best_covered_nll={best_nll:.6f}  "
+          f"best_step={best_step}  ckpt={best_path}")
 
 
 # ── Eval-only mode ────────────────────────────────────────────────────────────
@@ -870,9 +1072,16 @@ def run_eval_only(args, token_emb_w: torch.Tensor, device,
     print(f"[eval_only] val_dir={args.val_dir}")
 
     if force_zero:
-        results, fp = eval_force_zero(args.val_dir, token_emb_w, args.eval_batch_size, device)
+        # Use r2s_np if available (needed for cand_super build in canonical_eval_refiner)
+        _r2s = r2s_np if r2s_np is not None else np.zeros(args.n_fine, dtype=np.int32)
+        results = canonical_eval_refiner(
+            None, args.val_dir, token_emb_w, _r2s, device,
+            force_zero=True, eval_batch_size=args.eval_batch_size,
+        )
+        fp = results["dataset_fingerprint"]
 
         print()
+        print(f"  eval_mode           : {results['eval_mode']}")
         print(f"  dataset_fingerprint : {fp}")
         print(f"  num_examples        : {results['num_examples']:,}")
         print(f"  num_covered         : {results['num_covered']:,}")
@@ -884,8 +1093,10 @@ def run_eval_only(args, token_emb_w: torch.Tensor, device,
         fail_hard     = getattr(args, "fail_on_baseline_mismatch", False)
 
         if baseline_path and os.path.isfile(baseline_path):
-            ok = check_baseline_match(results, fp, baseline_path, fail_hard,
-                                      context=variant_tag)
+            with open(baseline_path) as _f:
+                bl = json.load(_f)
+            ok = check_baseline_match(results, bl, fail_hard,
+                                      context=variant_tag, check_nll=True)
             print(f"\n  Force-zero result: {'PASS' if ok else 'FAIL'}")
         elif fail_hard:
             raise RuntimeError(
@@ -1024,6 +1235,8 @@ def _parse():
                         "(residual_scale=0 → delta=0 → scores==force_zero).")
     p.add_argument("--print_delta_stats",        action="store_true",
                    help="Print additional delta diagnostics during init identity check.")
+    p.add_argument("--max_eval_examples",        type=int, default=None,
+                   help="Cap validation examples for quick subset eval (default: full val).")
     p.add_argument("--device",                  default="cuda")
     return p.parse_args()
 
