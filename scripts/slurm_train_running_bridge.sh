@@ -16,27 +16,34 @@
 #   RunningBridgeUpdate  : path_state + h_L evidence → updated path_state (per update layer)
 #   RunningBridgeRefiner : [RESIDUAL_TOKEN + path_state] → out_proj(zero-init) → delta_final
 #   final_only: h_refined = h_prime + alpha * delta_final
-#   multi_write: h_refined += sum_i(alpha_Li * delta_Li)  (write_projs zero-init)
-#                h_L_effective = h_L + prev_delta  (simulated causal chain, gradient flows)
+#   final_patch_sim: diagnostic — adds all delta_Li to h_prime (NOT causal)
+#                    h_L_effective = h_L + prev_delta for gradient flow only
 #   Decode: logits = h_refined @ token_emb.T  (full-vocab, V=50257)
 #
 # Hypothesis: Maintaining persistent path-state across multiple backbone layers (tracking
 # the trajectory of how path decisions form) should outperform one-shot adapters.
 #
 # Runs:
-#   1. final_only  → boundary_running_finalonly_v0/
-#   2. multi_write → boundary_running_multiwrite_v0/
+#   1. final_only      → boundary_running_finalonly_v0/
+#   2. final_patch_sim → boundary_running_finalpatchsim_v0/
+#      (diagnostic: adds multiple deltas to h_prime, NOT causal)
+#
+# NOTE: causal_multi_write is UNAVAILABLE.
+# Dataset stores per-position hidden states (N, n_layers, d_model) only.
+# Remaining frozen backbone blocks cannot be re-run from injected residuals
+# without input_ids. final_patch_sim is the diagnostic substitute.
+# The real causal experiment requires dataset rebuild with input_ids saved.
 #
 # Loss: CE + lambda_kl * KL_topk(512) + lambda_delta * sum_delta + lambda_path * path_norm
 # Eff batch: 32 * 2 = 64 boundary examples per step
 # PRIMARY eval metric: full_vocab_gated_nll_all  (vs full_vocab_base_nll_all)
 #
 # Architecture comparison targets (prior results):
-#   V1 BridgeResidualAdapter      : +0.003037 NLL improvement
-#   MidLayerBridgeAdapter         : +0.003347 NLL improvement
-#   ExplicitBridgeRefiner         : +0.003305 NLL improvement
-#   RunningBridge final_only  V0  : target > +0.003347 (beat MidLayer)
-#   RunningBridge multi_write V0  : target > +0.005 (meaningful gain from causal chain)
+#   V1 BridgeResidualAdapter          : +0.003037 NLL improvement
+#   MidLayerBridgeAdapter             : +0.003347 NLL improvement
+#   ExplicitBridgeRefiner             : +0.003305 NLL improvement
+#   RunningBridge final_only      V0  : target > +0.003347 (beat MidLayer)
+#   RunningBridge final_patch_sim V0  : diagnostic — not directly comparable to causal
 #
 # Prerequisite: slurm_debug_running_bridge.sh must have passed BOTH modes.
 #
@@ -75,10 +82,10 @@ VAL_FEAT_DIR=runs/path_refiner_residual_interface/features/val_multilayer
 BASELINE_JSON=runs/path_refiner_clean/baselines/saved_candidate_baseline.json
 
 OUTPUT_FINALONLY=runs/path_refiner_running_bridge/boundary_running_finalonly_v0
-OUTPUT_MULTIWRITE=runs/path_refiner_running_bridge/boundary_running_multiwrite_v0
+OUTPUT_FINALPATCH=runs/path_refiner_running_bridge/boundary_running_finalpatchsim_v0
 
 DEBUG_JSON_FO=runs/path_refiner_running_bridge/debug_identity_finalonly/debug_identity.json
-DEBUG_JSON_MW=runs/path_refiner_running_bridge/debug_identity_multiwrite/debug_identity.json
+DEBUG_JSON_FP=runs/path_refiner_running_bridge/debug_identity_finalpatchsim/debug_identity.json
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
 
@@ -88,7 +95,7 @@ echo "    Architecture:"
 echo "      RunningBridgeUpdate  : path_state trajectory over update_layers=[2,4]"
 echo "      RunningBridgeRefiner : [RESIDUAL + path_state] → delta_final  (zero-init)"
 echo "      final_only           : h_refined = h_prime + alpha * delta_final"
-echo "      multi_write          : h_refined += sum_i(alpha_Li * delta_Li)  (causal sim)"
+echo "      final_patch_sim : diagnostic — adds all delta_Li to h_prime (NOT causal)"
 echo "      Decode               : logits = h_refined @ token_emb.T  (full-vocab)"
 echo ""
 echo "    SMALL_CKPT      : $SMALL_CKPT"
@@ -98,8 +105,8 @@ echo "    TRAIN_FEAT_DIR  : $TRAIN_FEAT_DIR"
 echo "    VAL_FEAT_DIR    : $VAL_FEAT_DIR"
 echo ""
 echo "    Runs:"
-echo "      1. final_only   → $OUTPUT_FINALONLY"
-echo "      2. multi_write  → $OUTPUT_MULTIWRITE"
+echo "      1. final_only      → $OUTPUT_FINALONLY"
+echo "      2. final_patch_sim → $OUTPUT_FINALPATCH  (diagnostic, NOT causal)"
 echo ""
 echo "    Config (both runs):"
 echo "      update_layers        = 2,4"
@@ -120,11 +127,13 @@ echo "      kl_topk              = 512"
 echo "      amp                  = True"
 echo ""
 echo "    Architecture comparison targets:"
-echo "      V1 BridgeResidualAdapter  : +0.003037 NLL improvement"
-echo "      MidLayerBridgeAdapter     : +0.003347 NLL improvement"
-echo "      ExplicitBridgeRefiner     : +0.003305 NLL improvement"
-echo "      RunningBridge final_only  : target > +0.003347  (beat MidLayer)"
-echo "      RunningBridge multi_write : target > +0.005     (meaningful gain)"
+echo "      V1 BridgeResidualAdapter          : +0.003037 NLL improvement"
+echo "      MidLayerBridgeAdapter             : +0.003347 NLL improvement"
+echo "      ExplicitBridgeRefiner             : +0.003305 NLL improvement"
+echo "      RunningBridge final_only      V0  : target > +0.003347  (beat MidLayer)"
+echo "      RunningBridge final_patch_sim V0  : diagnostic (NOT causal_multi_write)"
+echo ""
+echo "    NOTE: causal_multi_write UNAVAILABLE — dataset has no input_ids."
 echo ""
 echo "    Success thresholds:"
 echo "      Weak        > +0.001"
@@ -162,20 +171,20 @@ if [[ "$PASS_FO" != "True" ]]; then
     exit 1
 fi
 
-# Require debug identity pass for multi_write
-if [[ ! -f "$DEBUG_JSON_MW" ]]; then
-    echo "ERROR: $DEBUG_JSON_MW not found." >&2
+# Require debug identity pass for final_patch_sim
+if [[ ! -f "$DEBUG_JSON_FP" ]]; then
+    echo "ERROR: $DEBUG_JSON_FP not found." >&2
     echo "       Run slurm_debug_running_bridge.sh first (both modes must pass)." >&2
     exit 1
 fi
-PASS_MW=$(python -c "import json; d=json.load(open('$DEBUG_JSON_MW')); print(d.get('identity_pass', False))" 2>/dev/null || echo "False")
-if [[ "$PASS_MW" != "True" ]]; then
-    echo "ERROR: identity_pass=$PASS_MW for multi_write — debug check failed." >&2
+PASS_FP=$(python -c "import json; d=json.load(open('$DEBUG_JSON_FP')); print(d.get('identity_pass', False))" 2>/dev/null || echo "False")
+if [[ "$PASS_FP" != "True" ]]; then
+    echo "ERROR: identity_pass=$PASS_FP for final_patch_sim — debug check failed." >&2
     echo "       Run slurm_debug_running_bridge.sh to fix invariant failures." >&2
     exit 1
 fi
 
-echo "    Preflight OK — both debug identity checks passed."
+echo "    Preflight OK — final_only and final_patch_sim debug identity checks passed."
 echo ""
 
 # Shard counts
@@ -192,7 +201,7 @@ if [[ "$N_TRAIN" -eq 0 || "$N_VAL" -eq 0 || "$N_TF" -eq 0 || "$N_VF" -eq 0 ]]; t
 fi
 echo ""
 
-mkdir -p "$OUTPUT_FINALONLY" "$OUTPUT_MULTIWRITE"
+mkdir -p "$OUTPUT_FINALONLY" "$OUTPUT_FINALPATCH"
 
 # ── Common args ───────────────────────────────────────────────────────────────
 
@@ -274,46 +283,63 @@ fi
 
 echo ""
 
-# ── Run 2: multi_write ────────────────────────────────────────────────────────
+# ── Run 2: final_patch_sim ────────────────────────────────────────────────────
+#
+# DIAGNOSTIC ONLY. Adds delta_L and delta_final all to h_prime.
+# This is NOT causal — remaining backbone blocks do not see the injected deltas.
+# causal_multi_write would require re-running backbone blocks from injected residuals,
+# which requires input_ids not present in the current dataset.
+#
 
 echo "========================================================================"
-echo "  RUN 2 / 2 : write_mode = multi_write"
-echo "  OUTPUT    : $OUTPUT_MULTIWRITE"
+echo "  RUN 2 / 2 : write_mode = final_patch_sim  (diagnostic, NOT causal)"
+echo "  OUTPUT    : $OUTPUT_FINALPATCH"
 echo "========================================================================"
 echo ""
-echo "  At each update layer L:"
-echo "    h_L_effective = h_L + prev_delta  (simulated causal chain, gradient flows)"
-echo "    path_state = RunningBridgeUpdate_L(path_state, h_L_effective, ...)"
-echo "    delta_L = write_projs[L](path_state[:,0,:])  (zero-init)"
-echo "    prev_delta = delta_L"
-echo "  Final:"
-echo "    delta_final = RunningBridgeRefiner(h_insert, path_state)  (zero-init)"
-echo "    h_refined = h_prime + alpha*delta_final + sum_i(alpha_Li * delta_Li)"
+echo "  DIAGNOSTIC MODE. What it does:"
+echo "    At each update layer L:"
+echo "      h_L_effective = h_L + prev_delta  (gradient signal, but h_L is cached)"
+echo "      path_state = RunningBridgeUpdate_L(path_state, h_L_effective, ...)"
+echo "      delta_L = write_projs[L](path_state[:,0,:])  (zero-init)"
+echo "      prev_delta = delta_L"
+echo "    Final:"
+echo "      delta_final = RunningBridgeRefiner(h_insert, path_state)"
+echo "      h_refined = h_prime + alpha*delta_final + sum_i(alpha_Li * delta_Li)"
+echo ""
+echo "  What it does NOT do:"
+echo "    Does NOT run backbone block3 from h2_refined."
+echo "    Does NOT run backbone block5 from h4_refined."
+echo "    All deltas accumulate into final h_prime only."
+echo ""
+echo "  causal_multi_write status: UNAVAILABLE"
+echo "    Dataset stores per-position hidden states, not full-sequence tensors."
+echo "    Cannot re-run backbone blocks from injected residuals without input_ids."
 echo ""
 
 python scripts/train_running_bridge.py \
     "${COMMON_ARGS[@]}" \
-    --write_mode  multi_write \
-    --output_dir  $OUTPUT_MULTIWRITE
+    --write_mode  final_patch_sim \
+    --output_dir  $OUTPUT_FINALPATCH
 
 echo ""
-echo "  Run 2 (multi_write) complete."
+echo "  Run 2 (final_patch_sim) complete."
 echo ""
 
 # Print final metrics if available
-MW_METRICS=$OUTPUT_MULTIWRITE/final_metrics.json
-if [[ -f "$MW_METRICS" ]]; then
+FP_METRICS=$OUTPUT_FINALPATCH/final_metrics.json
+if [[ -f "$FP_METRICS" ]]; then
     python -c "
 import json
-m = json.load(open('$MW_METRICS'))
+m = json.load(open('$FP_METRICS'))
 base = m.get('full_vocab_base_nll_all', float('nan'))
 gate = m.get('full_vocab_gated_nll_all', float('nan'))
 imp  = base - gate
-print('  multi_write final metrics:')
+print('  final_patch_sim final metrics:')
 print(f'    full_vocab_base_nll_all   = {base:.6f}')
 print(f'    full_vocab_gated_nll_all  = {gate:.6f}')
 print(f'    NLL improvement           = {imp:+.6f}')
 print(f'    best step                 = {m.get(\"best_step\", \"?\")}')
+print('    NOTE: diagnostic only — NOT comparable to causal_multi_write.')
 " 2>/dev/null || echo "  (could not read final_metrics.json)"
 fi
 
@@ -351,8 +377,8 @@ rows = [
      'runs/path_refiner_explicit_bridge_refiner/boundary_insert4_refiner2_path4_v1'),
     ('RunningBridge final_only V0',
      'runs/path_refiner_running_bridge/boundary_running_finalonly_v0'),
-    ('RunningBridge multi_write V0',
-     'runs/path_refiner_running_bridge/boundary_running_multiwrite_v0'),
+    ('RunningBridge final_patch_sim V0',
+     'runs/path_refiner_running_bridge/boundary_running_finalpatchsim_v0'),
 ]
 
 print(f'  {\"Architecture\":<35} {\"base_nll\":>10} {\"gated_nll\":>10} {\"improvement\":>12}')
@@ -382,11 +408,12 @@ echo "      If yes  → running path-state over 2 layers is more informative tha
 echo "                the single insert-state snapshot in MidLayer."
 echo "      If no   → the trajectory doesn't add information beyond the final snapshot."
 echo ""
-echo "  Q2: Does multi_write beat final_only?"
-echo "      If yes  → writing intermediate deltas and simulated causal feedback help."
+echo "  Q2: Does final_patch_sim beat final_only?"
+echo "      If yes  → multiple delta writes to h_prime help even without true causal injection."
+echo "      NOTE: this does NOT test whether backbone blocks see the injected residuals."
 echo "      If no   → early writes add noise; the final write alone is sufficient."
 echo ""
-echo "  Q3: Do layer_delta_norms grow during training for multi_write?"
+echo "  Q3: Do layer_delta_norms grow during training for final_patch_sim?"
 echo "      If they stay near zero → write_projs not learning; consider separate lr."
 echo "      If they grow faster than final_delta → intermediate writes dominate."
 echo ""
@@ -407,8 +434,8 @@ echo ""
 echo "=== Running Bridge Adapter V0 — Training COMPLETE  $(date) ==="
 echo ""
 echo "Output directories:"
-echo "  final_only   : $OUTPUT_FINALONLY"
-echo "  multi_write  : $OUTPUT_MULTIWRITE"
+echo "  final_only      : $OUTPUT_FINALONLY"
+echo "  final_patch_sim : $OUTPUT_FINALPATCH  (diagnostic)"
 echo ""
 echo "Key files per run:"
 echo "  best_refiner.pt      — best checkpoint (saved only if gated < base NLL)"

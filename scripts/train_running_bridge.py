@@ -13,11 +13,18 @@ Pipeline:
 write_mode = final_only:
   Path state tracks trajectory across layers. Single final write to h_prime.
 
-write_mode = multi_write:
-  Also writes small delta_L to h_prime at each update layer (zero-init write_projs).
-  Previous delta_L fed as additional input to next update (simulated causal chain):
-    h_L_effective = h_L + delta_{L-1}  (gradient flows back through the chain)
+write_mode = final_patch_sim:
+  Diagnostic only. Writes delta_L directly to final h_prime at each update layer
+  (zero-init write_projs). h_L_effective = h_L + prev_delta feeds gradient signal
+  forward, but this is NOT causal — all deltas add to h_prime, not to residual stream
+  before remaining blocks run.
   h_refined = h_prime + alpha*delta_final + sum(alpha_L * delta_L)
+
+write_mode = causal_multi_write:
+  UNAVAILABLE. Requires re-running frozen backbone blocks from injected intermediate
+  residuals. The dataset only stores per-position hidden states (N, n_layers, d_model),
+  not full-sequence tensors needed to run block(h_full_sequence). Will abort with
+  RuntimeError at startup — do not use until dataset includes input_ids.
 
 Identity invariant at step 0:
   Refiner.out_proj zero-init → delta_final = 0.
@@ -37,7 +44,8 @@ Usage:
         --baseline_json  runs/path_refiner_clean/baselines/saved_candidate_baseline.json \\
         --super_map runs/hard_memory_predictive_hierarchy/region_to_superregion_K24.json \\
         --output_dir runs/path_refiner_running_bridge/boundary_running_finalonly_v0 \\
-        --write_mode final_only --update_layers 2,4 \\
+        --write_mode final_only \
+        --update_layers 2,4 \\
         --bridge_dim 256 --bridge_update_layers 1 --bridge_heads 4 \\
         --refiner_dim 256 --refiner_layers 2 --refiner_heads 4 \\
         --num_path_tokens 4 \\
@@ -314,8 +322,12 @@ class RunningBridgeAdapter(nn.Module):
     Running Bridge Adapter V0.
 
     write_mode='final_only': path tracks trajectory, single delta write to h_prime.
-    write_mode='multi_write': also writes delta_L to h_prime at each update layer;
-        h_L_effective = h_L + prev_delta feeds causal signal to the next update.
+    write_mode='final_patch_sim': diagnostic — writes delta_L to h_prime at each update
+        layer; h_L_effective = h_L + prev_delta for gradient flow, but this is NOT causal
+        (all deltas add to h_prime, not injected into residual stream mid-backbone).
+    write_mode='causal_multi_write': UNAVAILABLE — aborts at construction time. Requires
+        full-sequence tensors to run remaining frozen blocks from injected residuals. The
+        dataset stores only per-position hidden states; input_ids are not saved.
 
     Identity: all write_projs and refiner.out_proj are zero-init → h_refined = h_prime at step 0.
     """
@@ -361,7 +373,16 @@ class RunningBridgeAdapter(nn.Module):
             for i in range(n_updates)
         ])
 
-        if write_mode == "multi_write":
+        if write_mode == "causal_multi_write":
+            raise RuntimeError(
+                "causal_multi_write requires live backbone continuation from injected residuals.\n"
+                "Current implementation would only patch h_prime, which is invalid.\n"
+                "Dataset stores per-position hidden states only (N, n_layers, d_model);\n"
+                "input_ids are not saved, so remaining frozen blocks cannot be re-run.\n"
+                "Use final_only or final_patch_sim instead."
+            )
+
+        if write_mode == "final_patch_sim":
             self.write_projs = nn.ModuleList([
                 nn.Linear(bridge_dim, d_model) for _ in range(n_updates)
             ])
@@ -408,7 +429,7 @@ class RunningBridgeAdapter(nn.Module):
         for i, (upd, layer_idx) in enumerate(
                 zip(self.update_modules, self.update_layer_idxs)):
             h_L = h_layers[:, layer_idx, :].float()
-            if self.write_mode == "multi_write" and prev_delta is not None:
+            if self.write_mode == "final_patch_sim" and prev_delta is not None:
                 h_L = h_L + prev_delta
 
             path_state = upd(
@@ -417,7 +438,7 @@ class RunningBridgeAdapter(nn.Module):
                 r_topk_reg, r_topk_prb, m_topk_reg, m_topk_prb, r_margin, m_margin,
             )
 
-            if self.write_mode == "multi_write":
+            if self.write_mode == "final_patch_sim":
                 delta_L = self.write_projs[i](path_state[:, 0, :])
                 layer_deltas.append((delta_L, self.alpha_layers[i]))
                 prev_delta = delta_L
@@ -868,7 +889,7 @@ def _generate_report(output_dir, args, full_vocab_base_nll, final_metrics,
     ml_bm  = _load("runs/path_refiner_midlayer_bridge/boundary_insert4_v1/best_metrics.json")
     ebr_bm = _load("runs/path_refiner_explicit_bridge_refiner/boundary_insert4_refiner2_path4_v1/best_metrics.json")
     fo_bm  = _load("runs/path_refiner_running_bridge/boundary_running_finalonly_v0/best_metrics.json")
-    mw_bm  = _load("runs/path_refiner_running_bridge/boundary_running_multiwrite_v0/best_metrics.json")
+    mw_bm  = _load("runs/path_refiner_running_bridge/boundary_running_causal_multiwrite_v0/best_metrics.json")
     own_bm = _load(os.path.join(output_dir, "best_metrics.json"))
 
     no_ckpt   = final_metrics.get("no_improving_checkpoint", True)
@@ -942,7 +963,7 @@ def _generate_report(output_dir, args, full_vocab_base_nll, final_metrics,
         f"| MidLayer Bridge (insert4) | {_fmtg(ml_bm,'full_vocab_gain_all')} | {_fmtg(ml_bm,'full_vocab_inside_gate_gain_all')} | {_fmtg(ml_bm,'masked_cand_gain')} |",
         f"| ExplicitBridgeRefiner (insert4) | {_fmtg(ebr_bm,'full_vocab_gain_all')} | {_fmtg(ebr_bm,'full_vocab_inside_gate_gain_all')} | {_fmtg(ebr_bm,'masked_cand_gain')} |",
         f"| **RunningBridge final_only** | {_fmtg(fo_bm,'full_vocab_gain_all')} | {_fmtg(fo_bm,'full_vocab_inside_gate_gain_all')} | {_fmtg(fo_bm,'masked_cand_gain')} |",
-        f"| **RunningBridge multi_write** | {_fmtg(mw_bm,'full_vocab_gain_all')} | {_fmtg(mw_bm,'full_vocab_inside_gate_gain_all')} | {_fmtg(mw_bm,'masked_cand_gain')} |",
+        f"| **RunningBridge final_patch_sim** (diag) | {_fmtg(mw_bm,'full_vocab_gain_all')} | {_fmtg(mw_bm,'full_vocab_inside_gate_gain_all')} | {_fmtg(mw_bm,'masked_cand_gain')} |",
         "",
         "## Success Criteria",
         "",
@@ -962,9 +983,9 @@ def _generate_report(output_dir, args, full_vocab_base_nll, final_metrics,
         "  Persistent path-state across layers helps even without mid-layer writes.",
         "  The trajectory of path decisions matters.",
         "",
-        "**If multi_write beats final_only:**",
-        "  Running causal injection (previous delta feeds next update) adds value.",
-        "  The simulated causal chain is beneficial.",
+        "**If final_patch_sim beats final_only:**",
+        "  Multiple delta writes to h_prime help even without true causal injection.",
+        "  Note: this is NOT causal — remaining blocks do not see the intermediate deltas.",
         "",
         "**If neither beats prior models:**",
         "  Missing piece may be: actual memory-neighbor tokens, real backbone re-execution,",
@@ -1102,7 +1123,8 @@ def train_running(
         print(f"  og_gate_diff (< 1e-5)        = {og_gate_diff:.2e}")
         print(f"  --- Model state ---")
         print(f"  final_delta_norm_max (→ 0)   = {d_max:.2e}")
-        print(f"  all_write_delta_norms = 0    (zero-init write_projs)" if args.write_mode == "multi_write" else "")
+        if args.write_mode == "final_patch_sim":
+            print(f"  all_write_delta_norms = 0    (zero-init write_projs, final_patch_sim diagnostic)")
         print(f"  path_norm_mean               = {g0['path_norm_mean']:.4f}")
         print(f"  alpha                        = {g0['alpha']:.4f}")
         print(f"  gold_force_included_rate     = {g0['gold_force_included_rate']:.4f}")
@@ -1586,8 +1608,14 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--output_dir",     required=True)
 
     p.add_argument("--write_mode",           default="final_only",
-                   choices=["final_only", "multi_write"],
-                   help="final_only: single write at end. multi_write: write at each update layer.")
+                   choices=["final_only", "final_patch_sim", "causal_multi_write"],
+                   help=(
+                       "final_only: single delta write to h_prime at end (valid). "
+                       "final_patch_sim: diagnostic — multiple deltas all added to h_prime "
+                       "(NOT causal; h_prime is patched, remaining blocks do not see injections). "
+                       "causal_multi_write: UNAVAILABLE — aborts immediately; requires input_ids "
+                       "to re-run frozen backbone blocks from injected residuals."
+                   ))
     p.add_argument("--update_layers",        default="2,4",
                    help="Comma-separated backbone block indices for update steps (e.g. '2,4')")
     p.add_argument("--bridge_dim",           type=int,   default=256)

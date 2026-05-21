@@ -21,20 +21,25 @@
 #     [RESIDUAL_TOKEN + path_state] → transformer → out_proj(zero-init) → delta_final
 #   Write (final_only):
 #     h_refined = h_prime + alpha * delta_final
-#   Write (multi_write, additionally):
+#   Write (final_patch_sim, additionally):
 #     write_projs[i](path_state[:,0,:]) → delta_L  (zero-init)
 #     h_refined += sum_i(alpha_L_i * delta_L_i)
 #     h_L_effective = h_L + prev_delta  (simulated causal chain, gradient flows)
 #   Decode: logits = h_refined @ token_emb.T  (full-vocab, V=50257)
 #
 # Tests BOTH modes:
-#   1. final_only  → debug_identity_finalonly/
-#   2. multi_write → debug_identity_multiwrite/
+#   1. final_only      → debug_identity_finalonly/
+#   2. final_patch_sim → debug_identity_finalpatchsim/
+#
+# NOTE: causal_multi_write is UNAVAILABLE. Dataset stores per-position hidden states
+# only (N, n_layers, d_model), not full-sequence tensors. Remaining frozen backbone
+# blocks cannot be re-run from injected residuals. If --write_mode causal_multi_write
+# is passed, the script aborts with RuntimeError immediately.
 #
 # Verifies at step 0 (eval_before_train, steps=1):
-#   1. delta_norm_max = 0.0          (Refiner out_proj is zero-initialized)
-#   2. all_write_delta_norms = 0.0   (write_projs zero-initialized, multi_write only)
-#   3. h_refined == h_prime          (within fp tolerance)
+#   1. delta_norm_max = 0.0              (Refiner out_proj is zero-initialized)
+#   2. all_write_delta_norms = 0.0       (write_projs zero-init, final_patch_sim only)
+#   3. h_refined == h_prime              (within fp tolerance)
 #   4. full_vocab_gated_nll_all == full_vocab_base_nll_all       (diff < 1e-3)
 #   5. full_vocab_gated_nll_covered == full_vocab_base_nll_covered (diff < 1e-3)
 #   6. masked_cand_gated_nll == masked_cand_base_nll              (diff < 1e-3)
@@ -46,11 +51,11 @@
 #
 # Required output format:
 #   variant = running_bridge_adapter
-#   write_mode = final_only | multi_write
+#   write_mode = final_only | final_patch_sim
 #   update_layers = [2, 4]
 #   num_path_tokens = 4
 #   delta_norm_max = 0.0
-#   all_write_delta_norms = 0.0   (multi_write)
+#   all_write_delta_norms = 0.0   (final_patch_sim)
 #   full_vocab_base_nll_all = 3.754938   (approx)
 #   full_vocab_gated_nll_all = 3.754938
 #   diff_all < 1e-3
@@ -88,7 +93,7 @@ VAL_CAND_DIR=runs/path_refiner_clean/data/val_hgrid_K24
 VAL_FEAT_DIR=runs/path_refiner_residual_interface/features/val_multilayer
 BASELINE_JSON=runs/path_refiner_clean/baselines/saved_candidate_baseline.json
 OUTPUT_FINALONLY=runs/path_refiner_running_bridge/debug_identity_finalonly
-OUTPUT_MULTIWRITE=runs/path_refiner_running_bridge/debug_identity_multiwrite
+OUTPUT_FINALPATCH=runs/path_refiner_running_bridge/debug_identity_finalpatchsim
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
 
@@ -97,8 +102,8 @@ echo ""
 echo "    Architecture:"
 echo "      RunningBridgeUpdate  : path_state + h_L → updated path_state  (per layer)"
 echo "      RunningBridgeRefiner : [RESIDUAL + path_state] → delta_final  (zero-init out_proj)"
-echo "      final_only           : h_refined = h_prime + alpha * delta_final"
-echo "      multi_write          : h_refined += sum_i(alpha_Li * delta_Li)  (zero-init write_projs)"
+echo "      final_only      : h_refined = h_prime + alpha * delta_final"
+echo "      final_patch_sim : diagnostic — adds all delta_Li to h_prime (NOT causal, zero-init write_projs)"
 echo "      Decode               : logits = h_refined @ token_emb.T  (full-vocab)"
 echo ""
 echo "    SMALL_CKPT   : $SMALL_CKPT"
@@ -107,7 +112,7 @@ echo "    VAL_FEAT_DIR : $VAL_FEAT_DIR"
 echo ""
 echo "    Identity checks (both modes):"
 echo "      1.  delta_norm_max = 0.0  (Refiner out_proj zero-init)"
-echo "      2.  all_write_delta_norms = 0.0  (write_projs zero-init, multi_write)"
+echo "      2.  all_write_delta_norms = 0.0  (write_projs zero-init, final_patch_sim)"
 echo "      3.  full_vocab_gated_nll_all == full_vocab_base_nll_all  (diff < 1e-3)"
 echo "      4.  full_vocab_gated_nll_covered == full_vocab_base_nll_covered  (diff < 1e-3)"
 echo "      5.  masked_cand_gated_nll == masked_cand_base_nll  (diff < 1e-3)"
@@ -161,7 +166,7 @@ for ul in [2, 4]:
 " 2>/dev/null || echo "    (could not resolve)"
 echo ""
 
-mkdir -p "$OUTPUT_FINALONLY" "$OUTPUT_MULTIWRITE"
+mkdir -p "$OUTPUT_FINALONLY" "$OUTPUT_FINALPATCH"
 
 # ── Common args ───────────────────────────────────────────────────────────────
 
@@ -262,11 +267,18 @@ print(f\"    identity_pass                = {d['identity_pass']}\")
 
 echo ""
 
-# ── Run 2: multi_write ────────────────────────────────────────────────────────
-
+# ── Run 2: final_patch_sim ────────────────────────────────────────────────────
+#
+# NOTE: final_patch_sim is a DIAGNOSTIC mode only.
+# It adds multiple deltas to h_prime (not causal — remaining blocks do not see
+# the injections). Named final_patch_sim to distinguish from true causal_multi_write.
+# causal_multi_write is UNAVAILABLE: aborts immediately with RuntimeError because
+# the dataset stores per-position hidden states, not full-sequence tensors needed
+# to re-run remaining frozen backbone blocks from injected residuals.
+#
 echo "========================================================================"
-echo "  RUN 2 / 2 : write_mode = multi_write"
-echo "  OUTPUT    : $OUTPUT_MULTIWRITE"
+echo "  RUN 2 / 2 : write_mode = final_patch_sim  (diagnostic, NOT causal)"
+echo "  OUTPUT    : $OUTPUT_FINALPATCH"
 echo "========================================================================"
 echo ""
 echo "  Identity invariant:"
@@ -274,36 +286,39 @@ echo "    write_projs zero-init   → delta_L=0  → prev_delta=0 → h_L_effect
 echo "    refiner.out_proj zero-init → delta_final=0"
 echo "    h_refined = h_prime + alpha*0 + sum_i(alpha_Li*0) = h_prime"
 echo ""
+echo "  NOTE: This is NOT causal_multi_write. All deltas add to h_prime only."
+echo "        causal_multi_write would require input_ids for backbone re-execution."
+echo ""
 
 python scripts/train_running_bridge.py \
     "${COMMON_ARGS[@]}" \
-    --write_mode  multi_write \
-    --output_dir  $OUTPUT_MULTIWRITE
+    --write_mode  final_patch_sim \
+    --output_dir  $OUTPUT_FINALPATCH
 
 # Verify debug_identity.json
-DEBUG_JSON_MW=$OUTPUT_MULTIWRITE/debug_identity.json
-if [[ ! -f "$DEBUG_JSON_MW" ]]; then
+DEBUG_JSON_FP=$OUTPUT_FINALPATCH/debug_identity.json
+if [[ ! -f "$DEBUG_JSON_FP" ]]; then
     echo "" >&2
-    echo "ERROR: $DEBUG_JSON_MW not found — multi_write identity check may have crashed." >&2
+    echo "ERROR: $DEBUG_JSON_FP not found — final_patch_sim identity check may have crashed." >&2
     exit 1
 fi
 
-PASS_MW=$(python -c "import json; d=json.load(open('$DEBUG_JSON_MW')); print(d.get('identity_pass', False))" 2>/dev/null || echo "False")
-if [[ "$PASS_MW" != "True" ]]; then
+PASS_FP=$(python -c "import json; d=json.load(open('$DEBUG_JSON_FP')); print(d.get('identity_pass', False))" 2>/dev/null || echo "False")
+if [[ "$PASS_FP" != "True" ]]; then
     echo "" >&2
-    echo "ERROR: identity_pass=$PASS_MW (multi_write) — check failed." >&2
-    echo "       Inspect $DEBUG_JSON_MW for details." >&2
+    echo "ERROR: identity_pass=$PASS_FP (final_patch_sim) — check failed." >&2
+    echo "       Inspect $DEBUG_JSON_FP for details." >&2
     exit 1
 fi
 
 echo ""
-echo "  multi_write identity PASSED."
+echo "  final_patch_sim identity PASSED."
 echo ""
 
 python -c "
 import json
-d = json.load(open('$DEBUG_JSON_MW'))
-print('  multi_write results:')
+d = json.load(open('$DEBUG_JSON_FP'))
+print('  final_patch_sim results:')
 print(f\"    variant              = {d.get('variant', 'running_bridge_adapter')}\")
 print(f\"    write_mode           = {d.get('write_mode', '?')}\")
 print(f\"    update_layers        = {d.get('update_layers', '?')}\")
@@ -326,6 +341,9 @@ for k in sorted(all_write_keys):
     print(f\"    {k:35s} = {d[k]:.2e}  (~0, write_proj zero-init)\")
 print(f\"    alpha                        = {d['alpha']:.4f}\")
 print(f\"    identity_pass                = {d['identity_pass']}\")
+print()
+print('    NOTE: final_patch_sim is diagnostic only — NOT causal.')
+print('    causal_multi_write requires input_ids; unavailable with current dataset.')
 " 2>/dev/null || echo "    (could not read debug_identity.json)"
 
 echo ""
@@ -337,8 +355,8 @@ echo "=== Running Bridge Adapter V0 — Identity Debug PASSED  $(date) ==="
 echo "========================================================================"
 echo ""
 echo "Both modes passed:"
-echo "  final_only  → $DEBUG_JSON_FO"
-echo "  multi_write → $DEBUG_JSON_MW"
+echo "  final_only      → $DEBUG_JSON_FO"
+echo "  final_patch_sim → $DEBUG_JSON_FP"
 echo ""
 echo "Confirmed (both modes):"
 echo "  variant              = running_bridge_adapter"
@@ -347,13 +365,18 @@ echo "  num_path_tokens      = 4"
 echo "  bridge_update_layers = 1  (transformer layers per RunningBridgeUpdate step)"
 echo "  refiner_layers       = 2  (thinker, zero-init out_proj)"
 echo "  delta_norm_max       = 0.0   (Refiner out_proj zero-init)"
-echo "  all_write_delta_norms = 0.0  (write_projs zero-init, multi_write)"
+echo "  all_write_delta_norms = 0.0  (write_projs zero-init, final_patch_sim)"
 echo "  full_vocab_gated_nll_all == full_vocab_base_nll_all   (diff < 1e-3)"
 echo "  masked_cand_base_nll matches canonical 3.378606  (diff < 1e-3)"
 echo "  gold_force_included_rate = 0.0000"
 echo "  canonical fingerprint / coverage OK"
 echo "  identity_pass = True in both debug_identity.json files"
 echo ""
+echo "NOTE: causal_multi_write is UNAVAILABLE."
+echo "  Dataset stores per-position hidden states only; remaining frozen backbone"
+echo "  blocks cannot be re-run from injected residuals without input_ids."
+echo "  final_patch_sim is a diagnostic — NOT a causal substitute."
+echo ""
 echo "Safe to proceed with slurm_train_running_bridge.sh"
 echo "  → runs/path_refiner_running_bridge/boundary_running_finalonly_v0"
-echo "  → runs/path_refiner_running_bridge/boundary_running_multiwrite_v0"
+echo "  → runs/path_refiner_running_bridge/boundary_running_finalpatchsim_v0"
