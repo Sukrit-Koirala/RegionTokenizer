@@ -1,0 +1,61 @@
+{
+  "pipeline": "live_context_retrieval_token_resolver",
+  "description": "Live context + nearest-neighbor retrieval for exact-token disambiguation",
+  "output_root": "runs/live_context_pipeline",
+  "stages": [
+    {
+      "stage_name": "stage01_build_live_context_dataset",
+      "status": "pending",
+      "start_time": null,
+      "end_time": null,
+      "output_dir": "runs/live_context_pipeline/stage01_context_data",
+      "key_metrics": {},
+      "error_message": null
+    },
+    {
+      "stage_name": "stage02_build_live_retrieval_index",
+      "status": "pending",
+      "start_time": null,
+      "end_time": null,
+      "output_dir": "runs/live_context_pipeline/stage02_retrieval_index/hctx_train",
+      "key_metrics": {},
+      "error_message": null
+    },
+    {
+      "stage_name": "stage03_attach_live_retrieval_neighbors",
+      "status": "pending",
+      "start_time": null,
+      "end_time": null,
+      "output_dir": "runs/live_context_pipeline/stage03_retrieval_neighbors",
+      "key_metrics": {},
+      "error_message": null
+    },
+    {
+      "stage_name": "stage04_audit_live_context_retrieval_data",
+      "status": "pending",
+      "start_time": null,
+      "end_time": null,
+      "output_dir": "runs/live_context_pipeline/stage04_data_audit",
+      "key_metrics": {},
+      "error_message": null
+    },
+    {
+      "stage_name": "stage05_debug_live_context_retrieval_resolver",
+      "status": "pending",
+      "start_time": null,
+      "end_time": null,
+      "output_dir": "runs/live_context_pipeline/stage05_debug_identity",
+      "key_metrics": {},
+      "error_message": null
+    },
+    {
+      "stage_name": "stage06_train_live_context_retrieval_resolver",
+      "status": "pending",
+      "start_time": null,
+      "end_time": null,
+      "output_dir": "runs/live_context_pipeline/stage06_train_ctxret_resolver",
+      "key_metrics": {},
+      "error_message": null
+    }
+  ]
+}
