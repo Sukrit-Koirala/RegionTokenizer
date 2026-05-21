@@ -202,6 +202,141 @@ def collate_bridge(batch: List[Dict]) -> Dict:
     return {k: torch.stack([b[k] for b in batch]) for k in batch[0]}
 
 
+class FilteredBridgeShardDataset(IterableDataset):
+    """
+    Like BridgeShardDataset but yields ONLY rows where filter_mask == True.
+
+    Because every yielded row already satisfies the filter, the training loop
+    can set train_mask=None (all rows), giving a full dense batch of hard
+    examples.  For batch_size=64 with boundary filter (~17%), the old approach
+    gave n_train≈3–9; this approach gives n_train=64.
+
+    Row selection:
+        keep = filter_mask
+        if train_covered_only:
+            keep = keep & covered
+
+    Full-vocab training does NOT require covered=True (gold_token is always in
+    the full vocabulary).  Only masked-candidate eval needs covered, and that
+    is handled by the eval function using the yielded `covered` field.
+
+    Prints stats on construction (one-time scan of candidate shards only):
+        [FilteredBridgeShardDataset]
+          filter=boundary  train_covered_only=False
+          shards=97  total_rows=1,000,209
+          kept_rows=177,353  kept_rate=17.7%
+          covered_within_kept=166,729 / 177,353 = 94.0%
+    """
+
+    def __init__(self, cand_dir: str, feat_dir: str, r2s_np: np.ndarray,
+                 filter_name: str, filter_kwargs: Optional[Dict] = None,
+                 train_covered_only: bool = False,
+                 shuffle: bool = False,
+                 print_stats: bool = True) -> None:
+        self.cand_dir           = cand_dir
+        self.feat_dir           = feat_dir
+        self.r2s_np             = r2s_np
+        self.filter_name        = filter_name
+        self.filter_kwargs      = filter_kwargs or {}
+        self.train_covered_only = train_covered_only
+        self.shuffle            = shuffle
+
+        paths = sorted(glob.glob(os.path.join(cand_dir, "shard_*.pt")))
+        if not paths:
+            raise RuntimeError(f"No shard_*.pt in {cand_dir}")
+        self._paths = paths
+
+        if print_stats:
+            self._print_stats()
+
+    def _print_stats(self) -> None:
+        total_rows = kept_rows = cov_within_kept = 0
+        for cand_path in self._paths:
+            cs  = torch.load(cand_path, map_location="cpu", weights_only=True)
+            N   = cs["gold_token"].shape[0]
+            fm  = compute_filter_mask(cs, self.filter_name, **self.filter_kwargs)
+            cov = cs["covered"].bool()
+            keep = fm & cov if self.train_covered_only else fm
+            total_rows      += N
+            kept_rows       += int(keep.sum())
+            cov_within_kept += int((cov & keep).sum())
+
+        kept_rate = kept_rows / max(total_rows, 1)
+        cov_rate  = cov_within_kept / max(kept_rows, 1)
+        print(f"[FilteredBridgeShardDataset]")
+        print(f"  filter              = {self.filter_name}")
+        print(f"  train_covered_only  = {self.train_covered_only}")
+        print(f"  shards              = {len(self._paths)}")
+        print(f"  total_rows          = {total_rows:,}")
+        print(f"  kept_rows           = {kept_rows:,}")
+        print(f"  kept_rate           = {kept_rate:.1%}")
+        print(f"  covered_within_kept = {cov_within_kept:,} / {kept_rows:,} = {cov_rate:.1%}")
+
+    def __iter__(self):
+        paths = list(self._paths)
+        if self.shuffle:
+            import random
+            random.shuffle(paths)
+
+        for cand_path in paths:
+            shard_idx = int(os.path.basename(cand_path)
+                            .replace("shard_", "").replace(".pt", ""))
+            feat_path = os.path.join(self.feat_dir, f"shard_{shard_idx:05d}.pt")
+            if not os.path.exists(feat_path):
+                raise RuntimeError(f"Missing feature shard: {feat_path}")
+
+            cs = torch.load(cand_path, map_location="cpu", weights_only=True)
+            fs = torch.load(feat_path,  map_location="cpu", weights_only=True)
+
+            if not torch.equal(cs["gold_token"].int(), fs["gold_token"].int()):
+                raise RuntimeError(
+                    f"Alignment FAIL: gold_token mismatch in shard {shard_idx:05d}")
+
+            N    = cs["gold_token"].shape[0]
+            fmask = compute_filter_mask(cs, self.filter_name, **self.filter_kwargs)
+            cov   = cs["covered"].bool()
+            keep  = fmask & cov if self.train_covered_only else fmask
+
+            keep_idx = keep.nonzero(as_tuple=False).squeeze(1)
+            if keep_idx.numel() == 0:
+                continue
+            if self.shuffle:
+                keep_idx = keep_idx[torch.randperm(keep_idx.numel())]
+
+            cf_np     = cs["cand_fine"].numpy().clip(min=0)
+            csuper_np = self.r2s_np[cf_np].astype(np.int64)
+            csuper_np[cs["cand_fine"].numpy() < 0] = 0
+            cand_super_t = torch.from_numpy(csuper_np)
+
+            has_mem = "mem_topk_reg" in cs
+            m_reg_t = cs["mem_topk_reg"] if has_mem else torch.zeros_like(cs["router_topk_reg"])
+            m_prb_t = cs["mem_topk_prb"] if has_mem else torch.zeros_like(cs["router_topk_prb"])
+            m_mar_t = cs["mem_margin"]   if has_mem else torch.zeros(N)
+
+            split_t = cs["split"] if "split" in cs else torch.zeros(N, dtype=torch.long)
+
+            for i in keep_idx.tolist():
+                yield {
+                    "h_prime":      cs["h_prime"][i].float(),
+                    "h_layers":     fs["h_layers"][i].float(),
+                    "cand_tok":     cs["cand_tok"][i].long(),
+                    "cand_fine":    cs["cand_fine"][i].long(),
+                    "cand_super":   cand_super_t[i].long(),
+                    "cand_mask":    (cs["cand_tok"][i] >= 0),
+                    "r_topk_reg":   cs["router_topk_reg"][i].long(),
+                    "r_topk_prb":   cs["router_topk_prb"][i].float(),
+                    "m_topk_reg":   m_reg_t[i].long(),
+                    "m_topk_prb":   m_prb_t[i].float(),
+                    "r_margin":     cs["router_margin"][i].float(),
+                    "m_margin":     m_mar_t[i].float(),
+                    "gold_token":   cs["gold_token"][i].long(),
+                    "gold_cand_idx":cs["gold_cand_idx"][i].long(),
+                    "covered":      cov[i],
+                    "filter_mask":  fmask[i].bool(),   # always True by construction
+                    "split":        split_t[i].long(),
+                }
+
+
 # ── Model ─────────────────────────────────────────────────────────────────────
 
 class BridgeResidualAdapter(nn.Module):
@@ -518,15 +653,15 @@ class BridgeResidualAdapter(nn.Module):
 # ── Loss ──────────────────────────────────────────────────────────────────────
 
 def compute_bridge_loss(
-    model:      BridgeResidualAdapter,
-    batch:      Dict,
+    model:        BridgeResidualAdapter,
+    batch:        Dict,
     device,
-    tok_emb_w:  torch.Tensor,
-    train_mask: torch.Tensor,     # (B,) bool — positions to train on (filter_mask & covered)
-    lambda_kl:  float,
+    tok_emb_w:    torch.Tensor,
+    train_mask:   Optional[torch.Tensor],  # None = all rows; (B,) bool otherwise
+    lambda_kl:    float,
     lambda_delta: float,
-    kl_topk:    int,
-    amp_enabled: bool = False,
+    kl_topk:      int,
+    amp_enabled:  bool = False,
 ) -> Tuple[Optional[torch.Tensor], Dict]:
     """
     Computes:
@@ -534,7 +669,11 @@ def compute_bridge_loss(
       loss_kl    — KL(base_topk_probs || refined_topk_logprobs) on train_mask
       loss_delta — L2 norm of delta_h on train_mask
     Returns (total_loss, info_dict).  Returns (None, {}) if no training rows.
+    train_mask=None means train on all rows in the batch (use with FilteredBridgeShardDataset).
     """
+    B = batch["gold_token"].shape[0]
+    if train_mask is None:
+        train_mask = torch.ones(B, dtype=torch.bool)
     n_train = int(train_mask.sum())
     if n_train == 0:
         return None, {}
@@ -1152,11 +1291,31 @@ def train_bridge(args, d_model: int, n_ctx_layers: int, n_fine: int, n_super: in
     print(f"  (If no checkpoint beats this, training is unsuccessful for this variant.)\n")
 
     # ── Dataset ───────────────────────────────────────────────────────────────
-    train_ds = BridgeShardDataset(
-        args.train_cand_dir, args.train_feat_dir,
-        r2s_np, args.train_filter,
-        filter_kwargs=filter_kwargs, shuffle=True,
-    )
+    use_filtered = args.use_filtered_train_loader
+    grad_accum   = max(1, args.grad_accum_steps)
+    eff_bs       = args.batch_size * grad_accum
+
+    print(f"[train] use_filtered_train_loader = {use_filtered}")
+    print(f"[train] batch_size                = {args.batch_size}")
+    print(f"[train] grad_accum_steps          = {grad_accum}")
+    print(f"[train] effective_hard_batch_size = {eff_bs}")
+    print(f"[train] train_covered_only        = {args.train_covered_only}")
+    print()
+
+    if use_filtered:
+        train_ds = FilteredBridgeShardDataset(
+            args.train_cand_dir, args.train_feat_dir,
+            r2s_np, args.train_filter,
+            filter_kwargs=filter_kwargs,
+            train_covered_only=args.train_covered_only,
+            shuffle=True,
+        )
+    else:
+        train_ds = BridgeShardDataset(
+            args.train_cand_dir, args.train_feat_dir,
+            r2s_np, args.train_filter,
+            filter_kwargs=filter_kwargs, shuffle=True,
+        )
 
     def _infinite():
         while True:
@@ -1212,59 +1371,83 @@ def train_bridge(args, d_model: int, n_ctx_layers: int, n_fine: int, n_super: in
     subset_csv.writeheader()
 
     best_path   = os.path.join(args.output_dir, "best_refiner.pt")
-    # ⚠ Safety: best_nll starts at full_vocab_base_nll.
+    # ⚠ Safety: best_nll starts at full_vocab_base_nll_all.
     # Checkpoint only saved if model strictly improves over base.
     best_nll  = full_vocab_base_nll
     best_step = -1
     ema_ce    = None
     t0        = time.time()
     model.train()
+    opt.zero_grad()
 
     for step in range(1, args.steps + 1):
-        batch      = next(train_inf)
-        train_mask = (
-            (batch["filter_mask"] & batch["covered"])
-            if args.train_covered_only
-            else batch["filter_mask"]
-        )
+        accum_infos: List[Dict] = []
+        valid_micro = 0
 
-        if args.amp:
-            with autocast("cuda"):
+        for _micro in range(grad_accum):
+            batch = next(train_inf)
+            if use_filtered:
+                train_mask = None  # all rows already satisfy filter
+            else:
+                train_mask = (
+                    (batch["filter_mask"] & batch["covered"])
+                    if args.train_covered_only
+                    else batch["filter_mask"]
+                )
+
+            if args.amp:
+                with autocast("cuda"):
+                    loss, info = compute_bridge_loss(
+                        model, batch, device, tok_dev, train_mask,
+                        args.lambda_kl, args.lambda_delta, args.kl_topk, amp_enabled=True)
+            else:
                 loss, info = compute_bridge_loss(
                     model, batch, device, tok_dev, train_mask,
-                    args.lambda_kl, args.lambda_delta, args.kl_topk, amp_enabled=True)
-        else:
-            loss, info = compute_bridge_loss(
-                model, batch, device, tok_dev, train_mask,
-                args.lambda_kl, args.lambda_delta, args.kl_topk)
+                    args.lambda_kl, args.lambda_delta, args.kl_topk)
 
-        if loss is None:
+            if loss is None:
+                continue
+
+            scaled = loss / grad_accum
+            if scaler is not None:
+                scaler.scale(scaled).backward()
+            else:
+                scaled.backward()
+
+            accum_infos.append(info)
+            valid_micro += 1
+
+        if valid_micro == 0:
             continue
 
-        opt.zero_grad()
         if scaler is not None:
-            scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(opt)
             scaler.update()
         else:
-            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
         sched.step()
+        opt.zero_grad()
 
-        ema_ce = info["ce"] if ema_ce is None else 0.95 * ema_ce + 0.05 * info["ce"]
+        avg_ce   = float(np.mean([d["ce"]         for d in accum_infos]))
+        avg_kl   = float(np.mean([d["kl"]         for d in accum_infos]))
+        avg_dn   = float(np.mean([d["delta_norm"] for d in accum_infos]))
+        tot_n    = sum(d["n_train"] for d in accum_infos)
+        avg_info = {"ce": avg_ce, "kl": avg_kl, "delta_norm": avg_dn, "n_train": tot_n}
+
+        ema_ce  = avg_ce if ema_ce is None else 0.95 * ema_ce + 0.05 * avg_ce
         alpha_v = float(model.alpha.item())
         lr_now  = sched.get_last_lr()[0]
 
-        train_csv.writerow({"step": step, **info, "alpha": alpha_v, "lr": lr_now})
+        train_csv.writerow({"step": step, **avg_info, "alpha": alpha_v, "lr": lr_now})
         if step % 100 == 0:
             train_logf.flush()
             print(f"  step={step:5d}  ema_ce={ema_ce:.4f}  "
-                  f"ce={info['ce']:.4f}  kl={info['kl']:.4f}  "
-                  f"d_norm={info['delta_norm']:.4f}  alpha={alpha_v:.4f}  "
-                  f"n_train={info['n_train']}  t={time.time()-t0:.0f}s")
+                  f"ce={avg_ce:.4f}  kl={avg_kl:.4f}  "
+                  f"d_norm={avg_dn:.4f}  alpha={alpha_v:.4f}  "
+                  f"n_train={tot_n}  eff_bs={eff_bs}  t={time.time()-t0:.0f}s")
 
         if step % args.eval_every == 0 or step == args.steps:
             print(f"\n  [eval] step={step} ...")
@@ -1513,10 +1696,16 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--kl_topk",        type=int,   default=512,
                    help="Approximate KL over top-K base logits (full 50k is expensive).")
     p.add_argument("--grad_clip",      type=float, default=1.0)
+    p.add_argument("--grad_accum_steps", type=int, default=1,
+                   help="Gradient accumulation steps. effective_hard_batch_size = batch_size * grad_accum_steps")
     # Flags
     p.add_argument("--amp",                    action="store_true")
     p.add_argument("--eval_before_train",      action="store_true")
     p.add_argument("--fail_on_baseline_mismatch", action="store_true")
+    p.add_argument("--use_filtered_train_loader", action="store_true",
+                   help="Pre-filter dataset to only yield rows matching train_filter. "
+                        "Fills every batch with hard examples (n_train=batch_size). "
+                        "Recommended for boundary/hard filters. Use with --batch_size 64.")
     p.add_argument("--train_covered_only",     action="store_true",
                    help="Restrict training to covered positions only (default: train on all filter positions)")
     p.add_argument("--device",         default="cuda")

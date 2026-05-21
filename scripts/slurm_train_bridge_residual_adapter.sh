@@ -50,6 +50,7 @@
 # Run order:
 #   slurm_build_multilayer_residual_features.sh  ← must have completed
 #   slurm_debug_bridge_residual_adapter.sh       ← MUST PASS before this
+#   slurm_debug_hard_sampler_bridge.sh           ← recommended before this
 #   → THIS SCRIPT
 
 source ~/miniconda3/bin/activate
@@ -143,6 +144,14 @@ print('    Do NOT compare full-vocab NLL to masked-candidate NLL.')
 mkdir -p "$OUTPUT_ROOT"
 
 # ── Shared args ───────────────────────────────────────────────────────────────
+#
+# use_filtered_train_loader:
+#   Yields only rows matching train_filter (boundary ≈ 17%).
+#   With batch_size=64 every microbatch has 64 hard examples (not 3–9).
+#   effective_hard_batch_size = batch_size * grad_accum_steps = 64.
+#
+# If GPU OOM, switch to: --batch_size 32 --grad_accum_steps 2
+#   (same effective batch, half activation memory per microstep)
 
 SHARED="
     --small_ckpt        $SMALL_CKPT
@@ -159,9 +168,10 @@ SHARED="
     --dropout           0.0
     --top_fine_regions  24
     --top_superregions  8
-    --steps             5000
+    --steps             10000
     --eval_every        1000
-    --batch_size        32
+    --batch_size        64
+    --grad_accum_steps  1
     --eval_batch_size   64
     --lr                1e-4
     --lambda_kl         0.1
@@ -171,21 +181,24 @@ SHARED="
     --amp
     --eval_before_train
     --fail_on_baseline_mismatch
+    --use_filtered_train_loader
     --device            cuda
 "
 
-# ── Run 1: boundary (primary) ─────────────────────────────────────────────────
+# ── Run 1: boundary — hard sampler (primary) ──────────────────────────────────
 
 echo ""
-echo "=== Run 1/1: boundary  $(date) ==="
-echo "    Output: $OUTPUT_ROOT/bridge_boundary_v1"
+echo "=== Run 1/1: boundary (hard sampler)  $(date) ==="
+echo "    Output: $OUTPUT_ROOT/bridge_boundary_v1_hardsampler"
+echo "    batch_size=64  grad_accum=1  eff_hard_batch=64"
+echo "    n_train will equal 64 every step (all rows match boundary filter)"
 echo ""
 
 python scripts/train_bridge_residual_adapter.py  \
     $SHARED                                       \
     --train_filter  boundary                      \
     --gate_filter   boundary                      \
-    --output_dir    $OUTPUT_ROOT/bridge_boundary_v1
+    --output_dir    $OUTPUT_ROOT/bridge_boundary_v1_hardsampler
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 
@@ -197,7 +210,7 @@ echo "  Threshold  : full_vocab_base_nll (computed at step 0)"
 echo "  Note       : full_vocab_base_nll != masked_cand_baseline (3.378606)"
 echo ""
 echo "Quick summary:"
-for d in "$OUTPUT_ROOT"/bridge_boundary_v1; do
+for d in "$OUTPUT_ROOT"/bridge_boundary_v1_hardsampler; do
     bm="$d/best_metrics.json"
     fm="$d/final_metrics.json"
     fb="$d/full_vocab_baseline.json"
@@ -249,4 +262,4 @@ echo "If no checkpoint was saved:"
 echo "  → bridge mechanism did not improve over frozen backbone for this gate/filter"
 echo "  → next steps: try harder filters, longer training, or joint training approach"
 echo ""
-echo "Report: runs/path_refiner_bridge_adapter/bridge_boundary_v1/  (train_log.csv, eval_log.csv, local_subset_eval.csv)"
+echo "Report: runs/path_refiner_bridge_adapter/bridge_boundary_v1_hardsampler/  (train_log.csv, eval_log.csv, local_subset_eval.csv)"
