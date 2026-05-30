@@ -1236,6 +1236,551 @@ def write_example_files(real_examples: List[dict], real_metrics: dict,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Capacity + Context-Length Ablation
+# ══════════════════════════════════════════════════════════════════════════════
+
+_ABLATION_VARIANT_CONFIGS: Dict[str, dict] = {
+    "last_token_mlp":     {"model_type": "last_token_mlp",  "n_layers": 0},
+    "mean_embedding_mlp": {"model_type": "mean_emb_mlp",    "n_layers": 0},
+    "real_router_L1":     {"model_type": "transformer",     "n_layers": 1},
+    "real_router_L2":     {"model_type": "transformer",     "n_layers": 2},
+    "real_router_L4":     {"model_type": "transformer",     "n_layers": 4},
+}
+
+_ABLATION_VARIANT_ORDER = [
+    "last_token_mlp",
+    "mean_embedding_mlp",
+    "real_router_L1",
+    "real_router_L2",
+    "real_router_L4",
+]
+
+_QUICK_VARIANTS      = ["last_token_mlp", "real_router_L1", "real_router_L2"]
+_QUICK_CONTEXT_LENS  = [32, 128]
+
+
+def _slice_data_context(data: dict, context_len: int) -> dict:
+    avail_T = data["input_ids"].shape[1]
+    if context_len > avail_T:
+        raise ValueError(
+            f"context_len={context_len} exceeds available sequence length T={avail_T}. "
+            f"Use shorter context_len or shards with longer sequences. "
+            f"Do NOT silently pad.")
+    sliced = dict(data)
+    sliced["input_ids"] = data["input_ids"][:, -context_len:]
+    sliced["seq_len"]   = context_len
+    return sliced
+
+
+def _make_ablation_model(variant_name: str,
+                          vocab_size: int,
+                          n_regions: int,
+                          n_super: int,
+                          d_model: int,
+                          n_heads: int,
+                          d_ff: int,
+                          dropout: float,
+                          context_len: int,
+                          use_super_aux: bool) -> nn.Module:
+    cfg = _ABLATION_VARIANT_CONFIGS[variant_name]
+    mtype = cfg["model_type"]
+    nlayers = cfg["n_layers"]
+
+    if mtype == "last_token_mlp":
+        return LastTokenMLPBaseline(vocab_size, n_regions, d_model, dropout)
+    elif mtype == "mean_emb_mlp":
+        return MeanEmbeddingMLPBaseline(vocab_size, n_regions, d_model, dropout)
+    elif mtype == "transformer":
+        return StaticRegionRouter(
+            vocab_size=vocab_size, n_regions=n_regions, n_super=n_super,
+            d_model=d_model, n_layers=nlayers, n_heads=n_heads,
+            d_ff=d_ff, dropout=dropout, max_seq_len=context_len,
+            use_super_aux=use_super_aux,
+        )
+    else:
+        raise ValueError(f"Unknown model_type: {mtype}")
+
+
+def _estimate_ablation_flops(model: nn.Module, context_len: int) -> int:
+    if hasattr(model, "estimate_forward_flops"):
+        return model.estimate_forward_flops(context_len)
+    # MLP baselines: embedding lookup + two Linear layers
+    d = model.tok_emb.embedding_dim
+    n_r = model.mlp[-1].out_features
+    return 2 * (d * d + d * n_r)
+
+
+def run_capacity_context_ablation(args,
+                                   train_data: dict,
+                                   val_data: dict,
+                                   tok_arr: np.ndarray,
+                                   reg_arr: np.ndarray,
+                                   n_regions: int,
+                                   n_super: int,
+                                   rsizes: np.ndarray,
+                                   vocab_known_count: int,
+                                   vocab_size: int,
+                                   use_super_aux: bool,
+                                   device: torch.device) -> List[dict]:
+    """
+    Run all (variant, context_len) combinations.
+    Returns list of result dicts for aggregation.
+    """
+    avail_T = train_data["seq_len"]
+    d_ff    = 4 * args.d_model
+    base_d  = args.base_d_model
+    full_lm_flops = vocab_known_count * base_d   # per spec
+
+    # Parse run matrix
+    context_lens: List[int] = sorted(set(
+        int(c) for c in args.context_lens.split(",") if c.strip()))
+    variants: List[str] = [v.strip() for v in args.variants.split(",") if v.strip()]
+
+    # Validate context lengths
+    for cl in context_lens:
+        if cl > avail_T:
+            raise ValueError(
+                f"context_len={cl} > shard sequence length {avail_T}. "
+                f"Shard does not have enough context. Aborting.")
+    unknown_v = [v for v in variants if v not in _ABLATION_VARIANT_CONFIGS]
+    if unknown_v:
+        raise ValueError(f"Unknown variants: {unknown_v}. "
+                         f"Valid: {list(_ABLATION_VARIANT_CONFIGS.keys())}")
+
+    out_root = args.output_dir
+    os.makedirs(out_root, exist_ok=True)
+
+    all_results: List[dict] = []
+    total_runs = len(context_lens) * len(variants)
+    run_idx    = 0
+
+    for context_len in context_lens:
+        train_sl = _slice_data_context(train_data, context_len)
+        val_sl   = _slice_data_context(val_data,   context_len)
+
+        for variant_name in variants:
+            run_idx += 1
+            run_label = f"{variant_name}_ctx{context_len}"
+            run_dir   = os.path.join(out_root, run_label)
+            os.makedirs(run_dir, exist_ok=True)
+
+            cfg     = _ABLATION_VARIANT_CONFIGS[variant_name]
+            n_layers= cfg["n_layers"]
+
+            print(f"\n{'─'*60}")
+            print(f"[ablation] run {run_idx}/{total_runs}: {run_label}")
+            print(f"  variant={variant_name}  context_len={context_len}  n_layers={n_layers}"
+                  f"  d_model={args.d_model}  n_heads={args.n_heads}")
+
+            np.random.seed(args.seed); random.seed(args.seed); torch.manual_seed(args.seed)
+
+            model = _make_ablation_model(
+                variant_name, vocab_size, n_regions, n_super,
+                args.d_model, args.n_heads, d_ff, args.dropout,
+                context_len, use_super_aux).to(device)
+            n_params       = model.count_params()
+            router_flops   = _estimate_ablation_flops(model, context_len)
+            print(f"  params={n_params:,}  router_flops_est={router_flops:,}")
+
+            # Save per-run config
+            run_cfg = {
+                "variant": variant_name, "context_len": context_len,
+                "n_layers": n_layers, "d_model": args.d_model,
+                "n_heads": args.n_heads, "dropout": args.dropout,
+                "params": n_params, "router_flops_est": router_flops,
+                "steps": args.steps, "batch_size": args.batch_size,
+                "lr": args.lr, "seed": args.seed,
+            }
+            with open(os.path.join(run_dir, "config.json"), "w") as f:
+                json.dump(run_cfg, f, indent=2)
+
+            # Train
+            t_train_start = time.time()
+            result = train_variant(
+                variant_name, model, train_sl, val_sl,
+                tok_arr, reg_arr, n_regions, n_super,
+                rsizes, vocab_known_count, args, device, run_dir)
+            train_seconds = time.time() - t_train_start
+
+            # Load best checkpoint for final eval
+            ckpt_path = result["checkpoint_path"]
+            if ckpt_path and os.path.isfile(ckpt_path):
+                ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+                model.load_state_dict(ck["state_dict"])
+
+            # Final eval
+            t_eval_start = time.time()
+            model.eval()
+            vm, slices, _ = eval_model(
+                variant_name, model, None,
+                val_sl, tok_arr, reg_arr, n_regions, n_super,
+                rsizes, vocab_known_count, device, args.batch_size * 4, args)
+            eval_seconds = time.time() - t_eval_start
+
+            # Save per-run CSVs
+            _wcsv(os.path.join(run_dir, "train_log.csv"), result["train_log"])
+            _wcsv(os.path.join(run_dir, "eval_log.csv"),  result["eval_log"])
+            _wcsv(os.path.join(run_dir, "slice_metrics.csv"), slices)
+            with open(os.path.join(run_dir, "best_metrics.json"), "w") as f:
+                bm_out = {k: (v if not isinstance(v, float) or v == v else None)
+                          for k, v in vm.items()}
+                json.dump(bm_out, f, indent=2)
+
+            # Compute ablation-specific efficiency metrics
+            avg_cs8   = vm.get("avg_candidate_set_size@8", float("nan"))
+            sel_fl8   = avg_cs8 * base_d if avg_cs8 == avg_cs8 else float("nan")
+            out_red8  = 1.0 - _safediv(sel_fl8, full_lm_flops) if sel_fl8 == sel_fl8 else float("nan")
+            total_c8  = (router_flops + sel_fl8) if sel_fl8 == sel_fl8 else float("nan")
+            speedup8  = _safediv(full_lm_flops, total_c8) if total_c8 == total_c8 else float("nan")
+
+            row = {
+                "variant":       variant_name,
+                "context_len":   context_len,
+                "n_layers":      n_layers,
+                "d_model":       args.d_model,
+                "n_heads":       args.n_heads,
+                "params":        n_params,
+                "router_flops_est":          router_flops,
+                "train_seconds":             round(train_seconds, 1),
+                "eval_seconds":              round(eval_seconds, 1),
+                "best_step":                 result.get("best_step"),
+                "no_improving_checkpoint":   result.get("no_improving_checkpoint_found", False),
+                # region metrics
+                "region_ce":                 vm.get("region_ce",             float("nan")),
+                "region_acc@1":              vm.get("region_acc@1",          float("nan")),
+                "region_recall@2":           vm.get("region_recall@2",       float("nan")),
+                "region_recall@4":           vm.get("region_recall@4",       float("nan")),
+                "region_recall@8":           vm.get("region_recall@8",       float("nan")),
+                "region_recall@16":          vm.get("region_recall@16",      float("nan")),
+                "region_recall@32":          vm.get("region_recall@32",      float("nan")),
+                "mean_rank_gold_region":     vm.get("mean_rank_gold_region", float("nan")),
+                "median_rank_gold_region":   vm.get("median_rank_gold_region", float("nan")),
+                "region_entropy":            vm.get("region_entropy",        float("nan")),
+                "region_margin_top1_top2":   vm.get("region_margin_top1_top2", float("nan")),
+                # candidate coverage
+                "candidate_fraction@4":      vm.get("candidate_fraction@4",  float("nan")),
+                "candidate_fraction@8":      vm.get("candidate_fraction@8",  float("nan")),
+                "candidate_fraction@16":     vm.get("candidate_fraction@16", float("nan")),
+                "avg_candidate_set_size@4":  vm.get("avg_candidate_set_size@4", float("nan")),
+                "avg_candidate_set_size@8":  avg_cs8,
+                "avg_candidate_set_size@16": vm.get("avg_candidate_set_size@16", float("nan")),
+                "gold_token_coverage@4":     vm.get("gold_token_coverage@4", float("nan")),
+                "gold_token_coverage@8":     vm.get("gold_token_coverage@8", float("nan")),
+                "gold_token_coverage@16":    vm.get("gold_token_coverage@16", float("nan")),
+                "base_top1_in_C@8":          vm.get("base_top1_in_C@8",     float("nan")),
+                "base_top5_any_in_C@8":      vm.get("base_top5_any_in_C@8", float("nan")),
+                "base_top10_any_in_C@8":     vm.get("base_top10_any_in_C@8", float("nan")),
+                # efficiency (clearly labeled as estimates)
+                "full_lm_head_flops_estimate":          full_lm_flops,
+                "selected_lm_head_flops_estimate@8":    sel_fl8,
+                "output_flop_reduction@8":              out_red8,
+                "total_estimated_cost@8":               total_c8,
+                "estimated_speedup_vs_full_lm_head@8":  speedup8,
+            }
+            all_results.append(row)
+
+            r8  = row["region_recall@8"]
+            r16 = row["region_recall@16"]
+            sp8 = row["estimated_speedup_vs_full_lm_head@8"]
+            print(f"  [done] recall@8={_fmt(r8)}  recall@16={_fmt(r16)}"
+                  f"  cand_frac@8={_fmt(row['candidate_fraction@8'])}"
+                  f"  est_speedup@8={_fmt(sp8)}"
+                  f"  train={train_seconds:.0f}s")
+
+    return all_results
+
+
+def write_ablation_report(results: List[dict],
+                           out_dir: str,
+                           args) -> str:
+    """Write comparison CSVs, markdown table, and analysis report."""
+    if not results:
+        return "DO_NOT_PROCEED"
+
+    # ── Sort order for tables ────────────────────────────────────────────────
+    def _sort_key(r):
+        ctx  = r["context_len"]
+        vidx = _ABLATION_VARIANT_ORDER.index(r["variant"]) if r["variant"] in _ABLATION_VARIANT_ORDER else 99
+        return (ctx, vidx)
+    results_sorted = sorted(results, key=_sort_key)
+
+    # ── Main comparison CSV ──────────────────────────────────────────────────
+    comp_cols = [
+        "variant", "context_len", "params", "router_flops_est",
+        "region_acc@1", "region_recall@4", "region_recall@8", "region_recall@16", "region_recall@32",
+        "candidate_fraction@8", "avg_candidate_set_size@8",
+        "base_top5_any_in_C@8",
+        "output_flop_reduction@8", "total_estimated_cost@8",
+        "estimated_speedup_vs_full_lm_head@8",
+        "train_seconds", "best_step",
+    ]
+    _wcsv(os.path.join(out_dir, "capacity_context_ablation.csv"),
+          [{c: r.get(c, float("nan")) for c in comp_cols} for r in results_sorted])
+
+    # ── Best by context length ───────────────────────────────────────────────
+    ctx_best: Dict[int, dict] = {}
+    for r in results:
+        cl  = r["context_len"]
+        r8  = r.get("region_recall@8", float("nan"))
+        if cl not in ctx_best or (r8 == r8 and r8 > ctx_best[cl].get("region_recall@8", float("nan"))):
+            ctx_best[cl] = r
+    _wcsv(os.path.join(out_dir, "best_by_context.csv"),
+          [{c: ctx_best[cl].get(c, float("nan")) for c in comp_cols} for cl in sorted(ctx_best)])
+
+    # ── Best by compute-recall tradeoff ──────────────────────────────────────
+    def _tradeoff_score(r):
+        sp = r.get("estimated_speedup_vs_full_lm_head@8", float("nan"))
+        r8 = r.get("region_recall@8", float("nan"))
+        if sp != sp or r8 != r8:
+            return float("-inf")
+        return sp * r8
+    results_by_tradeoff = sorted(results, key=_tradeoff_score, reverse=True)
+    _wcsv(os.path.join(out_dir, "best_by_compute_tradeoff.csv"),
+          [{c: r.get(c, float("nan")) for c in comp_cols} for r in results_by_tradeoff[:10]])
+
+    # ── Derive key values for Q&A ────────────────────────────────────────────
+    def _get(variant, ctx, key, default=float("nan")):
+        for r in results:
+            if r["variant"] == variant and r["context_len"] == ctx:
+                return r.get(key, default)
+        return default
+
+    context_lens = sorted(set(r["context_len"] for r in results))
+    variants_used = [v for v in _ABLATION_VARIANT_ORDER if any(r["variant"] == v for r in results)]
+
+    # Q1/Q2: Context length effect on recall@8 for best transformer
+    # Use real_router_L2 as reference (or L1/L4 if L2 not present)
+    ref_v = "real_router_L2" if "real_router_L2" in variants_used else (
+            "real_router_L1" if "real_router_L1" in variants_used else variants_used[-1])
+    ctx_recall = {cl: _get(ref_v, cl, "region_recall@8") for cl in context_lens}
+    ctx_recall16 = {cl: _get(ref_v, cl, "region_recall@16") for cl in context_lens}
+
+    # Context improvement
+    ctx_vals = [ctx_recall[cl] for cl in context_lens if ctx_recall[cl] == ctx_recall[cl]]
+    max_ctx_gain = max(ctx_vals) - min(ctx_vals) if len(ctx_vals) >= 2 else float("nan")
+
+    # Q3-Q5: Layer effect
+    best_ctx = context_lens[-1]  # largest context as reference
+    r8_lt  = _get("last_token_mlp",  best_ctx, "region_recall@8")
+    r8_L1  = _get("real_router_L1",  best_ctx, "region_recall@8")
+    r8_L2  = _get("real_router_L2",  best_ctx, "region_recall@8")
+    r8_L4  = _get("real_router_L4",  best_ctx, "region_recall@8")
+    gain_L1_vs_lt = r8_L1 - r8_lt if (r8_L1 == r8_L1 and r8_lt == r8_lt) else float("nan")
+    gain_L2_vs_L1 = r8_L2 - r8_L1 if (r8_L2 == r8_L2 and r8_L1 == r8_L1) else float("nan")
+    gain_L4_vs_L2 = r8_L4 - r8_L2 if (r8_L4 == r8_L4 and r8_L2 == r8_L2) else float("nan")
+
+    # Q6: Best model overall by recall@8
+    best_r8_row = max(results, key=lambda r: r.get("region_recall@8", float("-inf")))
+    best_variant_by_recall = best_r8_row["variant"]
+    best_recall8 = best_r8_row["region_recall@8"]
+    best_recall16 = best_r8_row.get("region_recall@16", float("nan"))
+
+    # Q7: Best compute-recall tradeoff
+    best_tradeoff_row = results_by_tradeoff[0] if results_by_tradeoff else {}
+    best_variant_by_tradeoff = best_tradeoff_row.get("variant", "?")
+    best_tradeoff_ctx = best_tradeoff_row.get("context_len", "?")
+
+    # Q8: Is longer context worth the compute?
+    if len(context_lens) >= 2:
+        short_ctx  = context_lens[0]
+        long_ctx   = context_lens[-1]
+        r8_short   = ctx_recall.get(short_ctx, float("nan"))
+        r8_long    = ctx_recall.get(long_ctx,  float("nan"))
+        ctx_marginal_gain = (r8_long - r8_short) if (r8_long == r8_long and r8_short == r8_short) else float("nan")
+        sp8_short  = _get(ref_v, short_ctx, "estimated_speedup_vs_full_lm_head@8")
+        sp8_long   = _get(ref_v, long_ctx,  "estimated_speedup_vs_full_lm_head@8")
+        ctx_worth_it = (ctx_marginal_gain == ctx_marginal_gain and
+                        ctx_marginal_gain > 0.02 and
+                        (sp8_long == sp8_long and sp8_long > 1.0))
+    else:
+        ctx_marginal_gain = float("nan"); ctx_worth_it = False
+        sp8_long = float("nan"); sp8_short = float("nan")
+
+    # ── Recommendation logic ─────────────────────────────────────────────────
+    def _nn(v): return v == v  # not nan
+
+    # 1. If best recall@8 >= 0.85 and recall@16 >= 0.92 → proceed
+    if _nn(best_recall8) and best_recall8 >= 0.85 and _nn(best_recall16) and best_recall16 >= 0.92:
+        recommendation = "PROCEED_TO_ROUTED_CANDIDATE_SOFTMAX"
+    elif _nn(best_recall8) and best_recall8 < 0.50:
+        recommendation = "DO_NOT_PROCEED"
+    elif (_nn(r8_L4) and _nn(r8_L2) and r8_L4 - r8_L2 >= 0.02
+          and _nn(sp8_long) and sp8_long > 1.0):
+        recommendation = "USE_L4_ROUTER"
+    elif (_nn(r8_L2) and _nn(r8_L1) and
+          not (_nn(r8_L1) and r8_L1 >= 0.95 * r8_L2)):
+        recommendation = "USE_L2_ROUTER"
+    elif _nn(r8_L1) and _nn(r8_L2) and r8_L1 >= 0.95 * r8_L2:
+        recommendation = "USE_L1_ROUTER"
+    elif (_nn(ctx_marginal_gain) and ctx_marginal_gain > 0.03
+          and long_ctx == max(context_lens)):
+        recommendation = "NEED_LONGER_CONTEXT_SHARDS"
+    elif _nn(r8_L1) and r8_L1 < 0.70:
+        # L1 router barely beats baseline
+        if _nn(r8_lt) and _nn(r8_L1) and r8_L1 - r8_lt < 0.02:
+            recommendation = "USE_LAST_TOKEN_BASELINE"
+        else:
+            recommendation = "PARTIAL_GO_IMPROVE_ROUTER"
+    else:
+        recommendation = "PARTIAL_GO_IMPROVE_ROUTER"
+
+    # ── Markdown comparison table ────────────────────────────────────────────
+    def _col(r, key, w=8):
+        v = r.get(key, float("nan"))
+        return _fmt(v)[:w] if _fmt(v) != "nan" else "nan"
+
+    md_rows = [
+        "| variant | ctx | params | r@4 | r@8 | r@16 | cand_frac@8 | avg_cands@8 | est_speedup@8 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for r in results_sorted:
+        md_rows.append(
+            f"| {r['variant']} "
+            f"| {r['context_len']} "
+            f"| {r.get('params',0):,} "
+            f"| {_col(r,'region_recall@4')} "
+            f"| {_col(r,'region_recall@8')} "
+            f"| {_col(r,'region_recall@16')} "
+            f"| {_col(r,'candidate_fraction@8')} "
+            f"| {_col(r,'avg_candidate_set_size@8',10)} "
+            f"| {_col(r,'estimated_speedup_vs_full_lm_head@8')} |"
+        )
+
+    # ── ASCII sparkline for recall@8 by context_len ──────────────────────────
+    def _sparkline(vals, width=40):
+        vv = [v for v in vals if v == v]
+        if not vv: return ""
+        lo, hi = min(vv), max(vv)
+        span = hi - lo if hi > lo else 1.0
+        bars = " _.-^*"
+        out_parts = []
+        for v in vals:
+            if v != v:
+                out_parts.append(" ")
+            else:
+                idx = int((v - lo) / span * (len(bars) - 1))
+                out_parts.append(bars[min(idx, len(bars)-1)])
+        return "".join(out_parts)
+
+    ctx_lines = []
+    for vn in variants_used:
+        recalls = [_get(vn, cl, "region_recall@8") for cl in context_lens]
+        spark   = _sparkline(recalls)
+        ctx_lines.append(f"  {vn:<28} ctx={context_lens} : {spark} "
+                         f"  values={[_fmt(v) for v in recalls]}")
+
+    # ── Report text ──────────────────────────────────────────────────────────
+    lines = [
+        "# Phase 1A Router Capacity + Context-Length Ablation Report",
+        "",
+        f"**steps:** {args.steps}  |  **d_model:** {args.d_model}  |  "
+        f"**n_heads:** {args.n_heads}  |  **seed:** {args.seed}",
+        f"**context_lens tested:** {context_lens}",
+        f"**variants tested:** {variants_used}",
+        "", "---", "",
+        "## Comparison Table",
+        "",
+        "*(All efficiency numbers are theoretical estimates, not measured end-to-end speedups.)*",
+        "",
+        *md_rows,
+        "", "---", "",
+        "## Recall@8 by Context Length",
+        "",
+        "*(ASCII sparkline: left=short ctx, right=long ctx, higher char = higher recall)*",
+        "",
+        *ctx_lines,
+        "", "---", "",
+        "## Q&A", "",
+    ]
+
+    def _q(n, q, ans, detail=""):
+        lines.append(f"### Q{n}: {q}")
+        lines.append(f"**{ans}**")
+        if detail: lines.append(f"\n{detail}")
+        lines.append("")
+
+    _q(1, "How much does context length improve recall@8?",
+       f"Max gain = {_fmt(max_ctx_gain)} (across ctx={context_lens}, model={ref_v})",
+       f"recall@8 by context: " + "  ".join(f"ctx{cl}={_fmt(ctx_recall.get(cl))}" for cl in context_lens))
+    _q(2, "Does recall saturate at 32, 64, or 128 tokens?",
+       f"See values above. Saturation if gain from ctx64→ctx128 < 0.005.",
+       f"ctx_marginal_gain ({context_lens[0]}→{context_lens[-1]}) = {_fmt(ctx_marginal_gain)}")
+    _q(3, "How much does L1 beat last-token MLP?",
+       f"L1 recall@8={_fmt(r8_L1)}  last_token={_fmt(r8_lt)}  gain={_fmt(gain_L1_vs_lt)}",
+       f"(at context_len={best_ctx})")
+    _q(4, "How much does L2 beat L1?",
+       f"L2 recall@8={_fmt(r8_L2)}  L1={_fmt(r8_L1)}  gain={_fmt(gain_L2_vs_L1)}",
+       f"(at context_len={best_ctx})")
+    _q(5, "How much does L4 beat L2?",
+       f"L4 recall@8={_fmt(r8_L4)}  L2={_fmt(r8_L2)}  gain={_fmt(gain_L4_vs_L2)}",
+       f"(at context_len={best_ctx})")
+    _q(6, "Which model has the best recall@8?",
+       f"{best_variant_by_recall} at ctx={best_r8_row.get('context_len','?')} "
+       f"(recall@8={_fmt(best_recall8)}  recall@16={_fmt(best_recall16)})")
+    _q(7, "Which model has the best recall-per-compute tradeoff?",
+       f"{best_variant_by_tradeoff} at ctx={best_tradeoff_ctx} "
+       f"(speedup*recall score={_fmt(_tradeoff_score(best_tradeoff_row))})",
+       f"speedup@8={_fmt(best_tradeoff_row.get('estimated_speedup_vs_full_lm_head@8'))}"
+       f"  recall@8={_fmt(best_tradeoff_row.get('region_recall@8'))}")
+    _q(8, "Is longer context worth the extra attention compute?",
+       f"{'YES' if ctx_worth_it else 'MARGINAL' if (_nn(ctx_marginal_gain) and ctx_marginal_gain > 0.01) else 'NO'}",
+       f"recall gain ({context_lens[0]}→{context_lens[-1]}) = {_fmt(ctx_marginal_gain)}  "
+       f"speedup@8 short={_fmt(sp8_short)} long={_fmt(sp8_long)}")
+    _q(9, "Should Phase 1 continue with last-token, L1, L2, or L4 router?",
+       f"Based on tradeoff: {best_variant_by_tradeoff} at ctx={best_tradeoff_ctx}",
+       f"L1 vs L2 gap={_fmt(gain_L2_vs_L1)}  L2 vs L4 gap={_fmt(gain_L4_vs_L2)}")
+    _q(10, "Should the next experiment be routed candidate softmax or router improvement?",
+       "PROCEED" if recommendation == "PROCEED_TO_ROUTED_CANDIDATE_SOFTMAX" else "IMPROVE_ROUTER",
+       f"Best recall@8={_fmt(best_recall8)}  best recall@16={_fmt(best_recall16)}")
+
+    # Verdict block
+    lines += [
+        "---", "",
+        "## PHASE 1A ROUTER CAPACITY + CONTEXT-LENGTH ABLATION VERDICT", "",
+        "```",
+        f"  {'variant':<28}  ctx   params    r@4     r@8     r@16    cand_f@8  speedup@8",
+        "  " + "─" * 90,
+    ]
+    for r in results_sorted:
+        lines.append(
+            f"  {r['variant']:<28}  {r['context_len']:3d}"
+            f"  {r.get('params',0):8,}"
+            f"  {_fmt(r.get('region_recall@4',   float('nan'))):6}"
+            f"  {_fmt(r.get('region_recall@8',   float('nan'))):6}"
+            f"  {_fmt(r.get('region_recall@16',  float('nan'))):6}"
+            f"  {_fmt(r.get('candidate_fraction@8', float('nan'))):8}"
+            f"  {_fmt(r.get('estimated_speedup_vs_full_lm_head@8', float('nan')))}"
+        )
+    lines += [
+        "",
+        f"Best recall@8:           {best_variant_by_recall}  ({_fmt(best_recall8)})",
+        f"Best recall@16:          {best_r8_row.get('variant','?')}  ({_fmt(best_recall16)})",
+        f"Best recall-per-compute: {best_variant_by_tradeoff}  ctx={best_tradeoff_ctx}",
+        f"Best context length:     ctx{context_lens[-1] if ctx_recall[context_lens[-1]] == ctx_recall[context_lens[-1]] else '?'}",
+        f"Recommended router:      {recommendation}",
+        f"Final recommendation:    {recommendation}",
+        "```", "",
+    ]
+
+    # Save report
+    rpt_path = os.path.join(out_dir, "capacity_context_ablation_report.md")
+    with open(rpt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"[save] {rpt_path}")
+
+    # Save markdown table separately
+    md_path = os.path.join(out_dir, "capacity_context_ablation.md")
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("# Phase 1A Router Capacity + Context-Length Ablation\n\n")
+        f.write("*(Efficiency numbers are theoretical estimates only.)*\n\n")
+        f.write("\n".join(md_rows))
+        f.write("\n")
+    print(f"[save] {md_path}")
+
+    return recommendation
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1265,7 +1810,21 @@ def main():
                    help="Base LM hidden size for FLOP estimates")
     p.add_argument("--seed",            type=int,   default=42)
     p.add_argument("--amp",             action="store_true")
+    # ── Ablation mode ─────────────────────────────────────────────────────────
+    p.add_argument("--run_capacity_context_ablation", action="store_true",
+                   help="Run the capacity + context-length ablation matrix")
+    p.add_argument("--context_lens",    type=str,   default="16,32,64,128",
+                   help="Comma-separated context lengths for ablation")
+    p.add_argument("--variants",        type=str,
+                   default="last_token_mlp,mean_embedding_mlp,real_router_L1,real_router_L2,real_router_L4",
+                   help="Comma-separated variant names for ablation")
+    p.add_argument("--quick",           action="store_true",
+                   help="Run quick ablation: context_lens=32,128 and L1/L2 only")
     args = p.parse_args()
+
+    if args.quick and args.run_capacity_context_ablation:
+        args.context_lens = ",".join(str(c) for c in _QUICK_CONTEXT_LENS)
+        args.variants      = ",".join(_QUICK_VARIANTS)
 
     np.random.seed(args.seed); random.seed(args.seed); torch.manual_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1291,6 +1850,62 @@ def main():
     tok_arr_real, reg_arr, n_regions, n_super = load_region_maps(
         args.token_to_region, args.super_map)
     use_super = not args.no_super_aux and n_super > 1
+
+    # ── Ablation branch ───────────────────────────────────────────────────────
+    if args.run_capacity_context_ablation:
+        r2t_real  = build_region_to_tokens(tok_arr_real, n_regions)
+        rsizes_real = build_region_cumsize(r2t_real)
+        vocab_known_count = int((tok_arr_real < n_regions).sum())
+        print(f"[ablation] vocab_known_count={vocab_known_count:,}")
+        print(f"[ablation] context_lens={args.context_lens}  variants={args.variants}")
+
+        ablation_results = run_capacity_context_ablation(
+            args, train_data, val_data,
+            tok_arr_real, reg_arr, n_regions, n_super,
+            rsizes_real, vocab_known_count, vocab_size, use_super, device)
+
+        recommendation = write_ablation_report(ablation_results, args.output_dir, args)
+
+        # ── Final console output ──────────────────────────────────────────────
+        elapsed = time.time() - t0_global
+        print(f"\n{'='*70}")
+        print(f" PHASE 1A ROUTER CAPACITY + CONTEXT LENGTH ABLATION  ({elapsed/60:.1f} min)")
+        print(f"{'='*70}")
+        print(f"\n| {'variant':<28} | {'ctx':>4} | {'params':>9} | {'r@4':>7} | "
+              f"{'r@8':>7} | {'r@16':>7} | {'cand_frac@8':>11} | {'avg_cands@8':>11} | {'est_speedup@8':>13} |")
+        print(f"|{'-'*30}|{'-'*6}|{'-'*11}|{'-'*9}|{'-'*9}|{'-'*9}|{'-'*13}|{'-'*13}|{'-'*15}|")
+        order_fn = lambda r: (r["context_len"],
+                              _ABLATION_VARIANT_ORDER.index(r["variant"])
+                              if r["variant"] in _ABLATION_VARIANT_ORDER else 99)
+        for r in sorted(ablation_results, key=order_fn):
+            print(f"| {r['variant']:<28} | {r['context_len']:>4} | {r.get('params',0):>9,} "
+                  f"| {_fmt(r.get('region_recall@4',  float('nan'))):>7} "
+                  f"| {_fmt(r.get('region_recall@8',  float('nan'))):>7} "
+                  f"| {_fmt(r.get('region_recall@16', float('nan'))):>7} "
+                  f"| {_fmt(r.get('candidate_fraction@8', float('nan'))):>11} "
+                  f"| {_fmt(r.get('avg_candidate_set_size@8', float('nan'))):>11} "
+                  f"| {_fmt(r.get('estimated_speedup_vs_full_lm_head@8', float('nan'))):>13} |")
+        best_r8_row  = max(ablation_results, key=lambda r: r.get("region_recall@8", float("-inf")))
+        best_r16_row = max(ablation_results, key=lambda r: r.get("region_recall@16", float("-inf")))
+        def _tradeoff(r):
+            sp = r.get("estimated_speedup_vs_full_lm_head@8", float("nan"))
+            r8 = r.get("region_recall@8", float("nan"))
+            return sp * r8 if (sp == sp and r8 == r8) else float("-inf")
+        best_td_row = max(ablation_results, key=_tradeoff)
+        print(f"\nBest recall@8:           {best_r8_row['variant']}  ctx={best_r8_row['context_len']}"
+              f"  ({_fmt(best_r8_row.get('region_recall@8'))})")
+        print(f"Best recall@16:          {best_r16_row['variant']}  ctx={best_r16_row['context_len']}"
+              f"  ({_fmt(best_r16_row.get('region_recall@16'))})")
+        print(f"Best recall-per-compute: {best_td_row['variant']}  ctx={best_td_row['context_len']}")
+        print(f"Best context length:     ctx{best_r8_row['context_len']}")
+        print(f"Recommended router:      {recommendation}")
+        print(f"Final recommendation:    {recommendation}")
+        print(f"{'='*70}")
+        print(f"\nKey outputs:")
+        print(f"  {args.output_dir}/capacity_context_ablation.csv")
+        print(f"  {args.output_dir}/capacity_context_ablation.md")
+        print(f"  {args.output_dir}/capacity_context_ablation_report.md")
+        return
 
     # ── Control maps ───────────────────────────────────────────────────────────
     print("\n[step 3] Building control maps...")
