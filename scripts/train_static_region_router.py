@@ -559,7 +559,9 @@ def coverage_metrics_with_tok_arr(region_logits: np.ndarray,
                                    region_sizes_arr: np.ndarray,
                                    known_mask: np.ndarray,
                                    n_regions: int,
-                                   vocab_known_count: int) -> Dict[str, float]:
+                                   vocab_known_count: int,
+                                   args=None,
+                                   data: Optional[dict] = None) -> Dict[str, float]:
     """Full coverage metrics including base-token coverage."""
     N, R = region_logits.shape
     out  = {}
@@ -589,8 +591,23 @@ def coverage_metrics_with_tok_arr(region_logits: np.ndarray,
                 recall_vals[ii] = in_topk[i, gr]
         recall = float(recall_vals.mean()) if len(recall_vals) > 0 else float("nan")
 
+        # V2C effective recall: head-covered rows are always covered
+        head_set_local = getattr(args, "head_set", set()) if args is not None else set()
+        if head_set_local:
+            gold_np_local = data.get("gold", np.zeros(N, dtype=np.int32)).astype(np.int64)
+            head_covered  = np.array([int(gold_np_local[i]) in head_set_local for i in range(N)], dtype=bool)
+            # Effective = head OR (known tail AND region_in_topk)
+            effective_hits = np.zeros(N, dtype=bool)
+            effective_hits[np.where(head_covered)[0]] = True
+            for ii, i in enumerate(known_idx):
+                if recall_vals[ii]: effective_hits[i] = True
+            eff_recall = float(effective_hits.mean())
+        else:
+            eff_recall = recall
+
         out[f"gold_region_recall@{k}"]   = recall
-        out[f"gold_token_coverage@{k}"]  = recall
+        out[f"gold_token_coverage@{k}"]  = eff_recall
+        out[f"effective_recall@{k}"]     = eff_recall
 
         # candidate_set_size@k — vectorised using region_sizes_arr
         cand_sizes = (in_topk.astype(np.int64) * region_sizes_arr[np.newaxis, :]).sum(axis=1).astype(np.float64)
@@ -747,7 +764,8 @@ def eval_model(variant_name: str,
     # ── Coverage metrics ──────────────────────────────────────────────────────
     cov_metrics = coverage_metrics_with_tok_arr(
         region_logits_all, gold_region, base_topk, tok_arr,
-        region_sizes_arr, known_mask, n_regions, vocab_known_count)
+        region_sizes_arr, known_mask, n_regions, vocab_known_count,
+        args=args, data=data)
 
     # ── Efficiency estimates ──────────────────────────────────────────────────
     base_d_model = getattr(args, "base_d_model", 384)
@@ -770,11 +788,20 @@ def eval_model(variant_name: str,
     n_unk    = N - n_known
     acc_at1 = float((ranked[known_idx, 0] == gold_region[known_idx]).mean()) if n_known > 0 else float("nan")
 
+    # ── V2C head coverage ──────────────────────────────────────────────────────
+    head_set = getattr(args, "head_set", set())
+    gold_np  = data["gold"].astype(np.int64)
+    gold_in_head_mask = np.array([int(gold_np[i]) in head_set for i in range(N)], dtype=bool)
+    n_head_gold = int(gold_in_head_mask.sum())
+    head_gold_rate = float(n_head_gold / N) if N > 0 else 0.0
+
     metrics = {
         "variant":               variant_name,
         "n_total":               N,
         "n_known_region":        n_known,
         "n_unknown_region":      n_unk,
+        "head_gold_rate":        head_gold_rate,
+        "tail_gold_rate":        float(n_known / N) if N > 0 else 0.0,
         "region_ce":             _nanmean(region_ce_arr),
         "region_acc@1":          acc_at1,
         "mean_rank_gold_region": _nanmean(region_rank_arr),
@@ -1820,6 +1847,14 @@ def main():
                    help="Comma-separated variant names for ablation")
     p.add_argument("--quick",           action="store_true",
                    help="Run quick ablation: context_lens=32,128 and L1/L2 only")
+    # ── V2 head-tail mode ─────────────────────────────────────────────────────
+    p.add_argument("--head_token_ids",  default=None,
+                   help="Path to .npy file with head token ids (V2C maps)")
+    p.add_argument("--head_tail_mode",  action="store_true",
+                   help="Enable head-tail routing: head tokens auto-covered, "
+                        "router only routes tail token rows")
+    p.add_argument("--candidate_policy_json", default=None,
+                   help="Optional candidate_policy.json for V2C maps")
     args = p.parse_args()
 
     if args.quick and args.run_capacity_context_ablation:
@@ -1850,6 +1885,20 @@ def main():
     tok_arr_real, reg_arr, n_regions, n_super = load_region_maps(
         args.token_to_region, args.super_map)
     use_super = not args.no_super_aux and n_super > 1
+
+    # ── V2 head-tail setup ────────────────────────────────────────────────────
+    head_token_ids_arr = None
+    if args.head_tail_mode and args.head_token_ids:
+        if not os.path.isfile(args.head_token_ids):
+            raise FileNotFoundError(f"head_token_ids not found: {args.head_token_ids}")
+        head_token_ids_arr = np.load(args.head_token_ids).astype(np.int32)
+        print(f"[head_tail] head_size={len(head_token_ids_arr):,}  "
+              f"head tokens: min={head_token_ids_arr.min()}  max={head_token_ids_arr.max()}")
+        # Tokens in head have tok_arr[t] = n_regions (unknown) → skipped from region CE
+        # This is already enforced by the map (V2C omits head tokens from token_to_region.json)
+        args.__dict__["head_set"] = set(int(t) for t in head_token_ids_arr)
+    else:
+        args.__dict__["head_set"] = set()
 
     # ── Ablation branch ───────────────────────────────────────────────────────
     if args.run_capacity_context_ablation:
